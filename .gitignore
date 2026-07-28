@@ -1,0 +1,21 @@
+# 虚拟环境
+.venv/
+venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 打包/构建
+build/
+dist/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
