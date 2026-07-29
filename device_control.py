@@ -51,7 +51,7 @@ FINISH_SOUND = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # X 轴快捷/自动循环的两个端点
 X_HOME = 0.0   # 起始位置
-X_END = 100.0  # 终点位置
+X_END = 220.0  # 终点位置
 
 # 状态帧: POS:X=+014.88,Y=+000.00,Z=+000.00,D=0,G=0
 STATUS_PATTERN = re.compile(
@@ -205,6 +205,7 @@ class MainWindow(tk.Tk):
         self._y_start = 0.0        # 内循环开始时的 Y 位置（大循环间要回到这里）
         self._auto_leg = "end"     # 当前段: "end"/"home"/"ystep"/"yback"
         self._auto_ystep = 10.0    # 循环间 Y 轴负向步进量
+        self._uv_dist = 120.0      # UV 灯开灯的 X 位置（水平距离）
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -297,7 +298,7 @@ class MainWindow(tk.Tk):
         quick_x = ttk.Frame(frame)
         quick_x.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_x, text="X 轴快捷:").pack(side="left", padx=4)
-        for text, target in [("零点位置 (1)", 1), ("起始位置 (0)", X_HOME), ("终点位置 (100)", X_END)]:
+        for text, target in [("零点位置 (1)", 1), ("起始位置 (0)", X_HOME), ("终点位置 (220)", X_END)]:
             b = ttk.Button(quick_x, text=text, width=14,
                            command=lambda t=target: self._move_to("X", t))
             b.pack(side="left", padx=4)
@@ -373,7 +374,7 @@ class MainWindow(tk.Tk):
         row2 = ttk.Frame(frame)
         row2.pack(fill="x")
         ttk.Label(row2, text="UV灯水平距离 (mm):").pack(side="left", padx=(16, 2), pady=4)
-        self.uv_dist_var = tk.StringVar(value="0")
+        self.uv_dist_var = tk.StringVar(value="120")
         ttk.Entry(row2, textvariable=self.uv_dist_var, width=8).pack(side="left", padx=2)
         # 自动UV灯: 自动循环中 X 向终点移动时开灯，其他情况关灯
         self.auto_uv_var = tk.BooleanVar(value=False)
@@ -546,6 +547,16 @@ class MainWindow(tk.Tk):
         if "X" in self._pending or "Y" in self._pending:
             messagebox.showwarning("提示", "X 或 Y 轴正在运动中，请等待到达后再开始自动循环")
             return
+        try:
+            uv_dist = float(self.uv_dist_var.get().strip())
+            if not (0 <= uv_dist <= X_END):
+                raise ValueError
+        except ValueError:
+            if self.auto_uv_var.get():
+                messagebox.showerror("错误", f"UV灯水平距离必须是 0 ~ {fmt_pos(X_END)} 之间的数字")
+                return
+            uv_dist = X_END  # 未启用自动UV灯时该值无意义
+        self._uv_dist = uv_dist
         self._auto_ystep = ystep
         self._inner_total = count
         self._auto_remaining = count
@@ -690,10 +701,18 @@ class MainWindow(tk.Tk):
         self.uv_btn.config(text=f"UV 灯: {'开' if on else '关'}")
 
     def _auto_uv_update(self):
-        """自动UV灯: 仅在自动循环 X 向终点(100)移动的段开灯，其余关灯"""
+        """自动UV灯: 非"向终点移动"的段一律关灯；向终点段的开灯由位置触发"""
         if not self.auto_uv_var.get():
             return
-        self._set_uv(self._auto_active and self._auto_leg == "end")
+        if not (self._auto_active and self._auto_leg == "end"):
+            self._set_uv(False)
+
+    def _auto_uv_position_check(self, x: float):
+        """向终点移动过程中，X 到达 UV 灯水平距离时开灯"""
+        if (self.auto_uv_var.get() and self._auto_active
+                and self._auto_leg == "end" and not self.uv_on
+                and x >= self._uv_dist):
+            self._set_uv(True)
 
     def _auto_uv_toggled(self):
         """勾选框状态改变: 取消勾选立即关灯，勾选则按当前循环段应用"""
@@ -744,6 +763,7 @@ class MainWindow(tk.Tk):
                 f"最后上报: {time.strftime('%H:%M:%S')}  {frame}")
             self._append_log(f"[上报] {frame}\n")
             self._check_arrival()
+            self._auto_uv_position_check(x)
         self.after(0, update)
 
     def _on_state_change(self, connected: bool, msg: str):
