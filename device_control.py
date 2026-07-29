@@ -11,6 +11,8 @@
 多条指令间隔 >= 50ms（程序内置发送队列自动保证）
 """
 
+import ctypes
+import os
 import queue
 import re
 import socket
@@ -42,6 +44,10 @@ JOG_LABELS = {
 CMD_UV_LAMP = "D"
 CMD_ROLLER = "G"
 CMD_ESTOP = "q"  # 急停：打断所有运动指令
+
+# 自动循环全部完成后的提示音
+FINISH_SOUND = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "assets", "freesound_community-goodresult-82807.mp3")
 
 # X 轴快捷/自动循环的两个端点
 X_HOME = 0.0   # 起始位置
@@ -198,7 +204,7 @@ class MainWindow(tk.Tk):
         self._outer_remaining = 0  # 大循环剩余次数
         self._y_start = 0.0        # 内循环开始时的 Y 位置（大循环间要回到这里）
         self._auto_leg = "end"     # 当前段: "end"/"home"/"ystep"/"yback"
-        self._auto_ystep = 13.54    # 循环间 Y 轴负向步进量
+        self._auto_ystep = 10.0    # 循环间 Y 轴负向步进量
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -649,7 +655,21 @@ class MainWindow(tk.Tk):
         self._outer_remaining = 0
         self.cycle_info_var.set("")
         self._append_log("[自动] 全部循环完成\n")
+        self._play_finish_sound()
         return False
+
+    def _play_finish_sound(self):
+        """循环完成提示音（Windows MCI 播放 MP3，异步不阻塞）"""
+        try:
+            winmm = ctypes.windll.winmm
+            alias = "cycle_finish"
+            winmm.mciSendStringW(f"close {alias}", None, 0, None)
+            if winmm.mciSendStringW(f'open "{FINISH_SOUND}" alias {alias}', None, 0, None) == 0:
+                winmm.mciSendStringW(f"play {alias}", None, 0, None)
+            else:
+                self._append_log(f"[提示] 音效文件无法播放: {FINISH_SOUND}\n")
+        except Exception as e:
+            self._append_log(f"[提示] 音效播放失败: {e}\n")
 
     def _refresh_position(self, axis: str):
         self.pos_labels[axis].config(text=fmt_pos(self.positions[axis]))
