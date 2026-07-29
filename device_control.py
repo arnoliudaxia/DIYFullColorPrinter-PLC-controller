@@ -192,8 +192,12 @@ class MainWindow(tk.Tk):
         self.cmd_widgets = []
         # X 轴自动循环状态
         self._auto_active = False
-        self._auto_remaining = 0   # 剩余循环次数
-        self._auto_leg = "end"     # 当前段目标: "end"(终点) / "home"(起始)
+        self._auto_remaining = 0   # 本组内剩余循环次数
+        self._inner_total = 0      # 每组内循环次数
+        self._outer_remaining = 0  # 大循环剩余次数
+        self._y_start = 0.0        # 内循环开始时的 Y 位置（大循环间要回到这里）
+        self._auto_leg = "end"     # 当前段: "end"/"home"/"ystep"/"yback"
+        self._auto_ystep = 10.0    # 循环间 Y 轴负向步进量
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -286,7 +290,7 @@ class MainWindow(tk.Tk):
         quick_x = ttk.Frame(frame)
         quick_x.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_x, text="X 轴快捷:").pack(side="left", padx=4)
-        for text, target in [("起始位置 (0)", X_HOME), ("终点位置 (100)", X_END)]:
+        for text, target in [("零点位置 (1)", 1), ("起始位置 (0)", X_HOME), ("终点位置 (100)", X_END)]:
             b = ttk.Button(quick_x, text=text, width=14,
                            command=lambda t=target: self._move_to("X", t))
             b.pack(side="left", padx=4)
@@ -301,26 +305,43 @@ class MainWindow(tk.Tk):
             b.pack(side="left", padx=4)
             self.cmd_widgets.append(b)
 
-        # 自动循环：X 在起始/终点之间往返
+        # 自动循环：X 在起始/终点之间往返，循环之间 Y 轴向 - 方向步进
         auto_row = ttk.Frame(frame)
         auto_row.grid(row=7, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(auto_row, text="自动X轴循环:").pack(side="left", padx=4)
         ttk.Label(auto_row, text="次数:").pack(side="left")
         self.cycle_var = tk.StringVar(value="1")
-        self.cycle_entry = ttk.Entry(auto_row, textvariable=self.cycle_var, width=6)
+        self.cycle_entry = ttk.Entry(auto_row, textvariable=self.cycle_var, width=5)
         self.cycle_entry.pack(side="left", padx=2)
+        ttk.Label(auto_row, text="Y 步进:").pack(side="left", padx=(8, 0))
+        self.ystep_var = tk.StringVar(value="10")
+        self.ystep_entry = ttk.Entry(auto_row, textvariable=self.ystep_var, width=5)
+        self.ystep_entry.pack(side="left", padx=2)
         start_btn = ttk.Button(auto_row, text="开始", width=8, command=self._start_auto)
         start_btn.pack(side="left", padx=4)
-        self.cmd_widgets += [start_btn, self.cycle_entry]
+        self.cmd_widgets += [start_btn, self.cycle_entry, self.ystep_entry]
         # 停止按钮始终可用（手动急停出口）
         ttk.Button(auto_row, text="停止", width=8, command=self._stop_auto).pack(side="left", padx=4)
         self.cycle_info_var = tk.StringVar(value="")
-        ttk.Label(auto_row, textvariable=self.cycle_info_var,
+
+        # 大循环：整组 X-Y 循环重复的次数，组间 Y 回到起始位置
+        outer_row = ttk.Frame(frame)
+        outer_row.grid(row=8, column=0, columnspan=7, sticky="w", pady=2)
+        ttk.Label(outer_row, text="大循环次数:").pack(side="left", padx=4)
+        self.outer_var = tk.StringVar(value="1")
+        self.outer_entry = ttk.Entry(outer_row, textvariable=self.outer_var, width=5)
+        self.outer_entry.pack(side="left", padx=2)
+        ttk.Label(outer_row, text="(每组结束后 Y 回到起始位置再重复)",
                   foreground="gray").pack(side="left", padx=8)
+        self.cmd_widgets.append(self.outer_entry)
+
+        # 循环状态显示（独立一行，避免超出窗口）
+        ttk.Label(frame, textvariable=self.cycle_info_var,
+                  foreground="gray").grid(row=9, column=0, columnspan=7)
 
         self.last_report_var = tk.StringVar(value="等待设备上报...")
         ttk.Label(frame, textvariable=self.last_report_var,
-                  foreground="gray").grid(row=8, column=0, columnspan=7, pady=6)
+                  foreground="gray").grid(row=10, column=0, columnspan=7, pady=6)
 
     def _build_device_frame(self):
         frame = ttk.LabelFrame(self, text="设备控制")
@@ -441,6 +462,10 @@ class MainWindow(tk.Tk):
 
     # ---------- X 轴自动循环 ----------
 
+    def _update_cycle_info(self):
+        self.cycle_info_var.set(
+            f"大循环剩余: {self._outer_remaining}，内循环剩余: {self._auto_remaining}")
+
     def _start_auto(self):
         try:
             count = int(self.cycle_var.get().strip())
@@ -449,11 +474,32 @@ class MainWindow(tk.Tk):
         except ValueError:
             messagebox.showerror("错误", "循环次数必须是正整数")
             return
-        self._auto_active = True
+        try:
+            outer = int(self.outer_var.get().strip())
+            if outer < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "大循环次数必须是正整数")
+            return
+        try:
+            ystep = abs(float(self.ystep_var.get().strip()))
+            if ystep == 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "Y 步进必须是正数")
+            return
+        self._auto_ystep = ystep
+        self._inner_total = count
         self._auto_remaining = count
+        self._outer_remaining = outer
+        self._y_start = self.positions["Y"]
+        self._auto_active = True
         self._auto_leg = "end"
-        self.cycle_info_var.set(f"剩余循环: {count}")
-        self._append_log(f"[自动] 开始循环 {count} 次（起始 {fmt_pos(X_HOME)} <-> 终点 {fmt_pos(X_END)}）\n")
+        self._update_cycle_info()
+        self._append_log(
+            f"[自动] 开始: 大循环 {outer} 组 x 内循环 {count} 次"
+            f"（X: {fmt_pos(X_HOME)} <-> {fmt_pos(X_END)}，循环间 Y -{fmt_pos(ystep)}，"
+            f"Y 起始位置 {fmt_pos(self._y_start)}）\n")
         self.sender.send_command(f"X={fmt_pos(X_END)}")
         self._wait_target("X", X_END)
 
@@ -461,10 +507,21 @@ class MainWindow(tk.Tk):
         if not self._auto_active:
             return
         self._auto_active = False
+        self._outer_remaining = 0
         self._pending.clear()
         self._set_cmd_enabled(True)
         self.cycle_info_var.set("")
         self._append_log("[自动] 已停止（当前这段运动会继续走完）\n")
+
+    def _auto_abort(self, reason: str):
+        """异常终止自动循环（如 Y 步进超出行程）"""
+        self._auto_active = False
+        self._outer_remaining = 0
+        self._pending.clear()
+        self._set_cmd_enabled(True)
+        self.cycle_info_var.set("")
+        self._append_log(f"[自动] 已中止: {reason}\n")
+        messagebox.showwarning("自动循环中止", reason)
 
     def _auto_advance(self) -> bool:
         """一段到达后推进自动循环，返回 True 表示已发出下一段"""
@@ -474,19 +531,59 @@ class MainWindow(tk.Tk):
             self.sender.send_command(f"X={fmt_pos(X_HOME)}")
             self._wait_target("X", X_HOME)
             return True
-        # 回到起始 -> 完成一个循环
+        if self._auto_leg == "ystep":
+            # Y 步进完成 -> 开始下一次内循环，向终点运动
+            self._auto_leg = "end"
+            self.sender.send_command(f"X={fmt_pos(X_END)}")
+            self._wait_target("X", X_END)
+            return True
+        if self._auto_leg == "yback":
+            # Y 已回到起始位置 -> 开始新一组内循环
+            self._auto_remaining = self._inner_total
+            self._update_cycle_info()
+            self._append_log(f"[自动] 开始新一组内循环（大循环剩余 {self._outer_remaining}）\n")
+            self._auto_leg = "end"
+            self.sender.send_command(f"X={fmt_pos(X_END)}")
+            self._wait_target("X", X_END)
+            return True
+        # leg == "home": 回到起始 -> 完成一次内循环
         self._auto_remaining -= 1
-        self.cycle_info_var.set(f"剩余循环: {self._auto_remaining}")
-        self._append_log(f"[自动] 完成一个循环，剩余 {self._auto_remaining}\n")
-        if self._auto_remaining <= 0:
-            self._auto_active = False
-            self.cycle_info_var.set("")
-            self._append_log("[自动] 全部循环完成\n")
-            return False
-        self._auto_leg = "end"
-        self.sender.send_command(f"X={fmt_pos(X_END)}")
-        self._wait_target("X", X_END)
-        return True
+        self._update_cycle_info()
+        self._append_log(f"[自动] 完成一次内循环，本组剩余 {self._auto_remaining}\n")
+        if self._auto_remaining > 0:
+            # 下一次内循环之前，Y 轴向 - 方向步进
+            y_target = self.positions["Y"] - self._auto_ystep
+            if not (AXIS_LIMITS["Y"][0] <= y_target <= AXIS_LIMITS["Y"][1]):
+                self._auto_abort(
+                    f"Y 步进后目标 {fmt_pos(y_target)} 超出行程 "
+                    f"[{fmt_pos(AXIS_LIMITS['Y'][0])}, {fmt_pos(AXIS_LIMITS['Y'][1])}]")
+                return False
+            self._auto_leg = "ystep"
+            self._append_log(f"[自动] Y 步进 -{fmt_pos(self._auto_ystep)} -> {fmt_pos(y_target)}\n")
+            self.sender.send_command(f"Y-{fmt_pos(self._auto_ystep)}")
+            self._wait_target("Y", y_target)
+            return True
+        # 本组内循环全部完成
+        if self._outer_remaining > 1:
+            # 还有大循环: Y 回到起始位置，再重复整组
+            self._outer_remaining -= 1
+            self._update_cycle_info()
+            if not (AXIS_LIMITS["Y"][0] <= self._y_start <= AXIS_LIMITS["Y"][1]):
+                self._auto_abort(f"Y 起始位置 {fmt_pos(self._y_start)} 超出行程")
+                return False
+            self._auto_leg = "yback"
+            self._append_log(
+                f"[自动] 本组完成，Y 回到起始位置 {fmt_pos(self._y_start)}"
+                f"（大循环剩余 {self._outer_remaining}）\n")
+            self.sender.send_command(f"Y={fmt_pos(self._y_start)}")
+            self._wait_target("Y", self._y_start)
+            return True
+        # 全部完成
+        self._auto_active = False
+        self._outer_remaining = 0
+        self.cycle_info_var.set("")
+        self._append_log("[自动] 全部循环完成\n")
+        return False
 
     def _refresh_position(self, axis: str):
         self.pos_labels[axis].config(text=fmt_pos(self.positions[axis]))
