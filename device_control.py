@@ -27,13 +27,25 @@ MIN_INTERVAL = 0.05  # 指令最小间隔 50ms
 POS_TOLERANCE = 0.1  # 判定到达目标位置的容差
 
 AXIS_LIMITS = {
-    "X": (-38.0, 232.0),
-    "Y": (-7.0, 123.0),
-    "Z": (-65.0, 130.5),
+    "X": (-10.0, 230.0),
+    "Y": (-5.0, 120.0),
+    "Z": (-60.0, 125.0),
+}
+
+# 点动按钮文字: {轴: (负方向, 正方向)}，保留正负号
+JOG_LABELS = {
+    "X": ("-右", "+左"),
+    "Y": ("-PASS", "+前"),
+    "Z": ("-下", "+上"),
 }
 
 CMD_UV_LAMP = "D"
 CMD_ROLLER = "G"
+CMD_ESTOP = "q"  # 急停：打断所有运动指令
+
+# X 轴快捷/自动循环的两个端点
+X_HOME = 0.0   # 起始位置
+X_END = 100.0  # 终点位置
 
 # 状态帧: POS:X=+014.88,Y=+000.00,Z=+000.00,D=0,G=0
 STATUS_PATTERN = re.compile(
@@ -93,6 +105,25 @@ class TcpSender:
     def send_command(self, cmd: str):
         """指令入队，由发送线程按间隔发出"""
         self._queue.put(cmd)
+
+    def send_urgent(self, cmd: str):
+        """急停指令：清空队列、立即发送，绕过 50ms 间隔"""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            sock = self.sock if self.connected else None
+        if sock is None:
+            self.on_state_change(False, f"未连接，急停指令未发送: {cmd}")
+            return
+        try:
+            sock.sendall(cmd.encode("ascii"))
+            self.on_sent(cmd)
+        except OSError as e:
+            self.on_state_change(False, f"急停发送失败: {e}")
+            self.disconnect()
 
     def _send_loop(self):
         while True:
@@ -159,6 +190,10 @@ class MainWindow(tk.Tk):
         self._pending = {}
         # 所有会发送指令的控件，统一 enable/disable
         self.cmd_widgets = []
+        # X 轴自动循环状态
+        self._auto_active = False
+        self._auto_remaining = 0   # 剩余循环次数
+        self._auto_leg = "end"     # 当前段目标: "end"(终点) / "home"(起始)
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -235,10 +270,10 @@ class MainWindow(tk.Tk):
             move_btn.grid(row=row, column=3, padx=4)
             self.cmd_widgets.append(move_btn)
 
-            jog_minus = ttk.Button(frame, text="-", width=4,
+            jog_minus = ttk.Button(frame, text=JOG_LABELS[axis][0], width=6,
                                    command=lambda a=axis: self._jog(a, -1))
             jog_minus.grid(row=row, column=4, padx=2)
-            jog_plus = ttk.Button(frame, text="+", width=4,
+            jog_plus = ttk.Button(frame, text=JOG_LABELS[axis][1], width=6,
                                   command=lambda a=axis: self._jog(a, 1))
             jog_plus.grid(row=row, column=5, padx=2)
             self.cmd_widgets += [jog_minus, jog_plus]
@@ -251,7 +286,7 @@ class MainWindow(tk.Tk):
         quick_x = ttk.Frame(frame)
         quick_x.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_x, text="X 轴快捷:").pack(side="left", padx=4)
-        for text, target in [("起始位置 (0)", 0), ("终点位置 (100)", 100)]:
+        for text, target in [("起始位置 (0)", X_HOME), ("终点位置 (100)", X_END)]:
             b = ttk.Button(quick_x, text=text, width=14,
                            command=lambda t=target: self._move_to("X", t))
             b.pack(side="left", padx=4)
@@ -260,15 +295,32 @@ class MainWindow(tk.Tk):
         quick_z = ttk.Frame(frame)
         quick_z.grid(row=6, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_z, text="Z 轴预设:").pack(side="left", padx=4)
-        for text, target in [("打印高度 (120)", 120), ("调试高度 (-10)", -10)]:
+        for text, target in [("打印高度 (125)", 125), ("调试高度 (-10)", -10)]:
             b = ttk.Button(quick_z, text=text, width=14,
                            command=lambda t=target: self._move_to("Z", t))
             b.pack(side="left", padx=4)
             self.cmd_widgets.append(b)
 
+        # 自动循环：X 在起始/终点之间往返
+        auto_row = ttk.Frame(frame)
+        auto_row.grid(row=7, column=0, columnspan=7, sticky="w", pady=2)
+        ttk.Label(auto_row, text="自动X轴循环:").pack(side="left", padx=4)
+        ttk.Label(auto_row, text="次数:").pack(side="left")
+        self.cycle_var = tk.StringVar(value="1")
+        self.cycle_entry = ttk.Entry(auto_row, textvariable=self.cycle_var, width=6)
+        self.cycle_entry.pack(side="left", padx=2)
+        start_btn = ttk.Button(auto_row, text="开始", width=8, command=self._start_auto)
+        start_btn.pack(side="left", padx=4)
+        self.cmd_widgets += [start_btn, self.cycle_entry]
+        # 停止按钮始终可用（手动急停出口）
+        ttk.Button(auto_row, text="停止", width=8, command=self._stop_auto).pack(side="left", padx=4)
+        self.cycle_info_var = tk.StringVar(value="")
+        ttk.Label(auto_row, textvariable=self.cycle_info_var,
+                  foreground="gray").pack(side="left", padx=8)
+
         self.last_report_var = tk.StringVar(value="等待设备上报...")
         ttk.Label(frame, textvariable=self.last_report_var,
-                  foreground="gray").grid(row=7, column=0, columnspan=7, pady=6)
+                  foreground="gray").grid(row=8, column=0, columnspan=7, pady=6)
 
     def _build_device_frame(self):
         frame = ttk.LabelFrame(self, text="设备控制")
@@ -279,6 +331,13 @@ class MainWindow(tk.Tk):
 
         self.roller_btn = ttk.Button(frame, text="滚子: 停止", width=16, command=self._toggle_roller)
         self.roller_btn.pack(side="left", padx=16, pady=8)
+
+        # 急停按钮始终可用（用 tk.Button 以便着色）
+        self.estop_btn = tk.Button(frame, text="急停", width=10,
+                                   bg="#d32f2f", fg="white",
+                                   font=("", 11, "bold"),
+                                   command=self._emergency_stop)
+        self.estop_btn.pack(side="left", padx=16, pady=8)
 
         self.cmd_widgets += [self.uv_btn, self.roller_btn]
 
@@ -369,14 +428,65 @@ class MainWindow(tk.Tk):
             self.status_var.set("运动中... 到达目标位置后才能发送新指令")
 
     def _check_arrival(self):
-        """每次收到状态帧后调用：所有等待轴都到达则解锁"""
+        """每次收到状态帧后调用：所有等待轴都到达则解锁（自动循环时继续下一段）"""
         arrived = [a for a, t in self._pending.items()
                    if abs(self.positions[a] - t) <= POS_TOLERANCE]
         for a in arrived:
             del self._pending[a]
         if arrived and not self._pending:
+            if self._auto_active and self._auto_advance():
+                return  # 自动循环下一段已发出，保持锁定
             self._set_cmd_enabled(True)
             self.status_var.set(f"已连接 {self.ip_var.get()}:{self.port_var.get()}（已到达目标位置）")
+
+    # ---------- X 轴自动循环 ----------
+
+    def _start_auto(self):
+        try:
+            count = int(self.cycle_var.get().strip())
+            if count < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "循环次数必须是正整数")
+            return
+        self._auto_active = True
+        self._auto_remaining = count
+        self._auto_leg = "end"
+        self.cycle_info_var.set(f"剩余循环: {count}")
+        self._append_log(f"[自动] 开始循环 {count} 次（起始 {fmt_pos(X_HOME)} <-> 终点 {fmt_pos(X_END)}）\n")
+        self.sender.send_command(f"X={fmt_pos(X_END)}")
+        self._wait_target("X", X_END)
+
+    def _stop_auto(self):
+        if not self._auto_active:
+            return
+        self._auto_active = False
+        self._pending.clear()
+        self._set_cmd_enabled(True)
+        self.cycle_info_var.set("")
+        self._append_log("[自动] 已停止（当前这段运动会继续走完）\n")
+
+    def _auto_advance(self) -> bool:
+        """一段到达后推进自动循环，返回 True 表示已发出下一段"""
+        if self._auto_leg == "end":
+            # 到达终点 -> 返回起始
+            self._auto_leg = "home"
+            self.sender.send_command(f"X={fmt_pos(X_HOME)}")
+            self._wait_target("X", X_HOME)
+            return True
+        # 回到起始 -> 完成一个循环
+        self._auto_remaining -= 1
+        self.cycle_info_var.set(f"剩余循环: {self._auto_remaining}")
+        self._append_log(f"[自动] 完成一个循环，剩余 {self._auto_remaining}\n")
+        if self._auto_remaining <= 0:
+            self._auto_active = False
+            self.cycle_info_var.set("")
+            self._append_log("[自动] 全部循环完成\n")
+            return False
+        self._auto_leg = "end"
+        self.sender.send_command(f"X={fmt_pos(X_END)}")
+        self._wait_target("X", X_END)
+        return True
 
     def _refresh_position(self, axis: str):
         self.pos_labels[axis].config(text=fmt_pos(self.positions[axis]))
@@ -392,6 +502,15 @@ class MainWindow(tk.Tk):
         self.sender.send_command(CMD_ROLLER)
         self.roller_on = not self.roller_on
         self.roller_btn.config(text=f"滚子: {'运行' if self.roller_on else '停止'}")
+
+    def _emergency_stop(self):
+        """急停：立即发送 q，打断所有运动，终止自动循环并解锁"""
+        self.sender.send_urgent(CMD_ESTOP)
+        self._auto_active = False
+        self._pending.clear()
+        self.cycle_info_var.set("")
+        self._set_cmd_enabled(True)
+        self._append_log("[急停] 已发送 q，打断所有指令\n")
 
     # ---------- 回调与日志 ----------
 
@@ -428,6 +547,8 @@ class MainWindow(tk.Tk):
             if not connected:
                 # 断开后清空等待目标并解锁，避免卡死
                 self._pending.clear()
+                self._auto_active = False
+                self.cycle_info_var.set("")
                 self._set_cmd_enabled(True)
         self.after(0, update)
 
