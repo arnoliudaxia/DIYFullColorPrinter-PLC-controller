@@ -12,6 +12,7 @@
 
 附加：扫描服务器连接（127.0.0.1:19090），仅建连并显示状态。
   连接成功后服务器发送: NETSCAN_SERVER_READY
+  闪喷命令 FLASH，回复单行: OK FLASH BEFORE=OFF AFTER=ON（回送修改前/后的闪喷状态）
 """
 
 import ctypes
@@ -36,9 +37,11 @@ SCAN_HOST = "127.0.0.1"
 SCAN_PORT = 19090
 SCAN_READY = "NETSCAN_SERVER_READY"  # 连接成功后服务器发送的就绪帧
 CMD_FLASH = "FLASH"                  # 闪喷命令
-FLASH_ACCEPTED = "OK FLASH_ACCEPTED" # 闪喷命令成功接受回复
+FLASH_ACCEPTED = "OK FLASH_ACCEPTED" # 旧版闪喷接受回复（兼容）
 FLASH_PAUSE_MS = 2000                # 维护闪喷时在终点暂停的时长
 DEFAULT_FLASH_INTERVAL = 10          # 默认闪喷间隔（X 到达终点的次数）
+# 闪喷回复（机器可解析单行）: OK FLASH BEFORE=OFF AFTER=ON
+FLASH_RESPONSE_PATTERN = re.compile(r"OK FLASH BEFORE=(\w+) AFTER=(\w+)")
 
 AXIS_LIMITS = {
     "X": (-10.0, 230.0),
@@ -291,6 +294,7 @@ class MainWindow(tk.Tk):
         self.positions = {axis: 0.0 for axis in AXIS_LIMITS}
         self.uv_on = False
         self.roller_on = False
+        self.flash_on = False  # 闪喷状态，以服务器回送的 AFTER 为准
 
         # 运动中的等待目标 {轴: 目标位置}，某轴非空时只锁定该轴的控件
         self._pending = {}
@@ -309,8 +313,10 @@ class MainWindow(tk.Tk):
         # 打印中维护闪喷：X 到达终点累计计数（不管 Y step / 大循环，一直累加）
         self._flash_count = 0      # X 到达终点累计次数
         self._flash_interval = DEFAULT_FLASH_INTERVAL
-        self._flash_pausing = False  # 是否处于闪喷暂停中
-        self._flash_after = None     # 闪喷恢复定时器 id
+        self._flash_pausing = False   # 是否处于闪喷暂停中
+        self._flash_after = None      # 闪喷恢复定时器 id
+        self._flash_wait_off = False  # 是否正在等待结束闪喷回送
+        self._flash_wait_after = None # 结束闪喷回送超时定时器 id
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -509,6 +515,13 @@ class MainWindow(tk.Tk):
         self.flash_btn = ttk.Button(row1, text="闪喷", width=16, command=self._send_flash)
         self.flash_btn.pack(side="left", padx=16, pady=8)
 
+        # 闪喷状态指示（只读，随服务器回送 BEFORE/AFTER 同步）
+        self.flash_state_var = tk.BooleanVar(value=False)
+        self.flash_state_cb = ttk.Checkbutton(row1, text="闪喷状态",
+                                              variable=self.flash_state_var,
+                                              state="disabled")
+        self.flash_state_cb.pack(side="left", padx=16, pady=8)
+
         # 急停按钮始终可用（用 tk.Button 以便着色）
         self.estop_btn = tk.Button(row1, text="急停", width=10,
                                    bg="#d32f2f", fg="white",
@@ -607,7 +620,21 @@ class MainWindow(tk.Tk):
     def _on_scan_response(self, line: str):
         def update():
             self._append_log(f"[扫描回复] {line}\n")
-            if FLASH_ACCEPTED in line:
+            m = FLASH_RESPONSE_PATTERN.fullmatch(line.strip())
+            if m:
+                before, after = m.group(1), m.group(2)
+                self.flash_on = after == "ON"
+                self.flash_state_var.set(self.flash_on)
+                self.status_var.set(f"闪喷状态: {before} -> {after}")
+                if self._flash_wait_off and not self.flash_on:
+                    # 结束闪喷已确认关闭，继续移动 X
+                    if self._flash_wait_after is not None:
+                        self.after_cancel(self._flash_wait_after)
+                        self._flash_wait_after = None
+                    self._flash_wait_off = False
+                    self._append_log("[自动] 闪喷已结束，继续自动循环\n")
+                    self._proceed_after_flash()
+            elif FLASH_ACCEPTED in line:
                 self.status_var.set(f"闪喷已接受: {FLASH_ACCEPTED}")
             elif line.startswith("未知命令"):
                 self.status_var.set(f"闪喷回复（未知命令）: {line}")
@@ -818,18 +845,31 @@ class MainWindow(tk.Tk):
         messagebox.showwarning("自动循环中止", reason)
 
     def _flash_pause(self):
-        """X 到达终点时暂停循环：发送闪喷命令，2s 后继续返回起始"""
+        """X 到达终点时暂停循环：发送闪喷命令，2s 后结束闪喷再继续"""
         self._flash_pausing = True
         self._append_log(
             f"[自动] X 到达终点，维护闪喷（间隔 {self._flash_interval}），暂停闪喷\n")
         self._send_flash()
-        self.status_var.set("闪喷中... 2s 后继续自动循环")
+        self.status_var.set("闪喷中... 2s 后结束闪喷")
         self._flash_after = self.after(FLASH_PAUSE_MS, self._flash_resume)
 
     def _flash_resume(self):
-        """闪喷暂停结束，继续返回起始"""
+        """闪喷暂停结束：若闪喷仍开启则先发送结束命令，确认关闭后再移动 X"""
         self._flash_after = None
         self._flash_pausing = False
+        if not self._auto_active:
+            return
+        if self.flash_on:
+            self._flash_wait_off = True
+            self._append_log("[自动] 发送结束闪喷命令\n")
+            self._send_flash()
+            self.status_var.set("结束闪喷中...")
+            self._flash_wait_after = self.after(FLASH_PAUSE_MS, self._flash_wait_timeout)
+            return
+        self._proceed_after_flash()
+
+    def _proceed_after_flash(self):
+        """结束闪喷确认后，继续返回起始位置"""
         if not self._auto_active:
             return
         self._auto_leg = "home"
@@ -837,12 +877,23 @@ class MainWindow(tk.Tk):
         self._wait_target("X", X_HOME)
         self._auto_uv_update()
 
+    def _flash_wait_timeout(self):
+        """结束闪喷回送超时保护：超时后直接继续移动，避免卡住"""
+        self._flash_wait_after = None
+        if self._flash_wait_off:
+            self._flash_wait_off = False
+            self._append_log("[自动] 结束闪喷回送超时，继续移动\n")
+            self._proceed_after_flash()
+
     def _cancel_flash_pause(self):
-        """取消未执行的闪喷恢复定时器（停止/中止/急停时调用）"""
-        if self._flash_after is not None:
-            self.after_cancel(self._flash_after)
-            self._flash_after = None
+        """取消未执行的闪喷定时器（停止/中止/急停/断开时调用）"""
+        for attr in ("_flash_after", "_flash_wait_after"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                self.after_cancel(timer)
+                setattr(self, attr, None)
         self._flash_pausing = False
+        self._flash_wait_off = False
 
     def _auto_advance(self) -> bool:
         """一段到达后推进自动循环，返回 True 表示已发出下一段"""
