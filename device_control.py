@@ -40,6 +40,13 @@ CMD_FLASH = "FLASH"                  # 闪喷命令
 FLASH_ACCEPTED = "OK FLASH_ACCEPTED" # 旧版闪喷接受回复（兼容）
 FLASH_PAUSE_MS = 2000                # 维护闪喷时在终点暂停的时长
 DEFAULT_FLASH_INTERVAL = 10          # 默认闪喷间隔（X 到达终点的次数）
+# X 循环计数到达阈值时 Z 轴下降
+X_CYCLE_COUNT_LIMIT = 200  # X 到达终点累计计数阈值
+X_CYCLE_Z_STEP = 0.5       # 达到阈值时 Z 轴下降量 (mm)
+# 各轴移动速度 (mm/s)，用于预计完成时间
+VX_MMS = 20.0
+VY_MMS = 10.0
+VZ_MMS = 1.0
 # 闪喷回复（机器可解析单行）: OK FLASH BEFORE=OFF AFTER=ON
 FLASH_RESPONSE_PATTERN = re.compile(r"OK FLASH BEFORE=(\w+) AFTER=(\w+)")
 
@@ -82,6 +89,12 @@ STATUS_PATTERN = re.compile(
 def fmt_pos(value: float) -> str:
     """位置数值格式化：整数不带小数点"""
     return str(int(value)) if value == int(value) else str(value)
+
+
+def fmt_duration(seconds: float) -> str:
+    """秒数格式化为 HH:MM:SS"""
+    s = int(round(seconds))
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
 # ---------- TCP 收发器 ----------
@@ -317,6 +330,9 @@ class MainWindow(tk.Tk):
         self._flash_after = None      # 闪喷恢复定时器 id
         self._flash_wait_off = False  # 是否正在等待结束闪喷回送
         self._flash_wait_after = None # 结束闪喷回送超时定时器 id
+        self._x_cycle_count = 0       # X 到达终点累计计数（达阈值清零）
+        self._auto_eta = 0.0          # 本次自动循环预计完成时间 (s)
+        self.eta_var = tk.StringVar(value="")  # 预计完成时间显示
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -491,13 +507,17 @@ class MainWindow(tk.Tk):
                   font=("", 10, "bold"), activebackground="#d32f2f",
                   command=self._stop_auto).pack(side="left", padx=4)
 
+        # 预计完成时间显示
+        ttk.Label(frame, textvariable=self.eta_var,
+                  foreground="#2e7d32").grid(row=10, column=0, columnspan=7, pady=2)
+
         # 循环状态显示（独立一行，避免超出窗口）
         ttk.Label(frame, textvariable=self.cycle_info_var,
-                  foreground="gray").grid(row=10, column=0, columnspan=7)
+                  foreground="gray").grid(row=11, column=0, columnspan=7)
 
         self.last_report_var = tk.StringVar(value="等待设备上报...")
         ttk.Label(frame, textvariable=self.last_report_var,
-                  foreground="gray").grid(row=11, column=0, columnspan=7, pady=6)
+                  foreground="gray").grid(row=12, column=0, columnspan=7, pady=6)
 
     def _build_device_frame(self):
         frame = ttk.LabelFrame(self, text="设备控制")
@@ -751,6 +771,20 @@ class MainWindow(tk.Tk):
         self.cycle_info_var.set(
             f"大循环剩余: {self._outer_remaining}，内循环剩余: {self._auto_remaining}")
 
+    def _estimate_auto_time(self, count: int, outer: int, ystep: float) -> float:
+        """按各轴速度估算整次自动循环完成时间（秒）"""
+        total_x = count * outer                       # X 到达终点总次数
+        x_dist = abs(X_END - X_HOME) * 2 * total_x    # 每内循环两次 X 行程
+        x_dist += abs(self.positions["X"] - X_HOME)   # 回起始位置的预移动
+        # Y: 每组内 (count-1) 次步进，组间回到起始位置
+        y_dist = (2 * outer - 1) * (count - 1) * ystep if count > 1 else 0.0
+        # Z: 每 200 次 X 循环下降 0.5
+        z_time = (total_x // X_CYCLE_COUNT_LIMIT) * X_CYCLE_Z_STEP / VZ_MMS
+        t = x_dist / VX_MMS + y_dist / VY_MMS + z_time
+        if self.flash_maintain_var.get():
+            t += (total_x // self._flash_interval) * (FLASH_PAUSE_MS / 1000.0)
+        return t
+
     def _start_auto(self):
         try:
             count = int(self.cycle_var.get().strip())
@@ -798,6 +832,7 @@ class MainWindow(tk.Tk):
             flash_int = DEFAULT_FLASH_INTERVAL
         self._flash_interval = flash_int
         self._flash_count = 0
+        self._x_cycle_count = 0
         self._cancel_flash_pause()
         self._auto_ystep = ystep
         self._inner_total = count
@@ -805,11 +840,14 @@ class MainWindow(tk.Tk):
         self._outer_remaining = outer
         self._y_start = self.positions["Y"]
         self._auto_active = True
+        self._auto_eta = self._estimate_auto_time(count, outer, ystep)
+        self.eta_var.set(f"预计完成时间: {fmt_duration(self._auto_eta)}")
         self._update_cycle_info()
         self._append_log(
             f"[自动] 开始: 大循环 {outer} 组 x 内循环 {count} 次"
             f"（X: {fmt_pos(X_HOME)} <-> {fmt_pos(X_END)}，循环间 Y -{fmt_pos(ystep)}，"
             f"Y 起始位置 {fmt_pos(self._y_start)}）\n")
+        self._append_log(f"[自动] 预计完成时间: {fmt_duration(self._auto_eta)}\n")
         self._lock_auto_group()
         # 先回起始位置，避免当前 X 位置不确定
         self._auto_leg = "prehome"
@@ -827,6 +865,7 @@ class MainWindow(tk.Tk):
         self._cancel_flash_pause()
         self._unlock_auto_group()
         self.cycle_info_var.set("")
+        self.eta_var.set("")
         if self.auto_uv_var.get():
             self._set_uv(False)
         self._append_log("[自动] 已停止（当前这段运动会继续走完）\n")
@@ -839,6 +878,7 @@ class MainWindow(tk.Tk):
         self._cancel_flash_pause()
         self._unlock_auto_group()
         self.cycle_info_var.set("")
+        self.eta_var.set("")
         if self.auto_uv_var.get():
             self._set_uv(False)
         self._append_log(f"[自动] 已中止: {reason}\n")
@@ -895,6 +935,18 @@ class MainWindow(tk.Tk):
         self._flash_pausing = False
         self._flash_wait_off = False
 
+    def _z_step_down(self):
+        """X 循环累计计数达阈值时，Z 轴下降 0.5（不阻塞自动循环）"""
+        target = self.positions["Z"] - X_CYCLE_Z_STEP
+        if not (AXIS_LIMITS["Z"][0] <= target <= AXIS_LIMITS["Z"][1]):
+            self._append_log(
+                f"[自动] Z 轴下降超出行程，跳过: 目标 {fmt_pos(target)}\n")
+            return
+        self.sender.send_command(f"Z-{fmt_pos(X_CYCLE_Z_STEP)}")
+        self._append_log(
+            f"[自动] X 循环计数达 {X_CYCLE_COUNT_LIMIT}，"
+            f"Z 轴下降 {fmt_pos(X_CYCLE_Z_STEP)} -> {fmt_pos(target)}\n")
+
     def _auto_advance(self) -> bool:
         """一段到达后推进自动循环，返回 True 表示已发出下一段"""
         if self._auto_leg == "prehome":
@@ -906,6 +958,11 @@ class MainWindow(tk.Tk):
         if self._auto_leg == "end":
             # 到达终点 -> 计数；启用维护闪喷且达间隔时，先暂停闪喷再返回起始
             self._flash_count += 1
+            # X 到达终点累计计数达阈值时，Z 轴下降（独立于闪喷计数）
+            self._x_cycle_count += 1
+            if self._x_cycle_count >= X_CYCLE_COUNT_LIMIT:
+                self._x_cycle_count = 0
+                self._z_step_down()
             if self.flash_maintain_var.get() and self._flash_count >= self._flash_interval:
                 self._flash_count = 0
                 self._flash_pause()
@@ -965,6 +1022,7 @@ class MainWindow(tk.Tk):
         self._auto_active = False
         self._outer_remaining = 0
         self.cycle_info_var.set("")
+        self.eta_var.set("")
         self._append_log("[自动] 全部循环完成\n")
         self._play_finish_sound()
         return False
@@ -1034,6 +1092,7 @@ class MainWindow(tk.Tk):
         self._pending.clear()
         self._cancel_flash_pause()
         self.cycle_info_var.set("")
+        self.eta_var.set("")
         self._unlock_all()
         if self.auto_uv_var.get():
             self._set_uv(False)
@@ -1079,6 +1138,7 @@ class MainWindow(tk.Tk):
                 self._outer_remaining = 0
                 self._cancel_flash_pause()
                 self.cycle_info_var.set("")
+                self.eta_var.set("")
                 self._unlock_all()
         self.after(0, update)
 
