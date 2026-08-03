@@ -49,6 +49,11 @@ CMD_ESTOP = "q"  # 急停：打断所有运动指令
 FINISH_SOUND = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "assets", "freesound_community-goodresult-82807.mp3")
 
+# UI 整体缩放系数（>=1.0 放大；所有字体、控件、间距随之等比例放大）
+UI_SCALE = 1.6
+# 窗口尺寸（宽, 高），按缩放系数放大
+WIN_SIZE = (400, 600)
+
 # X 轴快捷/自动循环的两个端点
 X_HOME = 0.0   # 起始位置
 X_END = 220.0  # 终点位置
@@ -185,7 +190,8 @@ class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("设备远程控制")
-        self.geometry("560x600")
+        self.tk.call("tk", "scaling", UI_SCALE)
+        self.geometry(f"{WIN_SIZE[0] * UI_SCALE:.0f}x{WIN_SIZE[1] * UI_SCALE:.0f}")
 
         # 位置/开关状态以设备周期性上报的状态帧为准
         self.positions = {axis: 0.0 for axis in AXIS_LIMITS}
@@ -315,7 +321,7 @@ class MainWindow(tk.Tk):
 
         # 自动循环：X 在起始/终点之间往返，循环之间 Y 轴向 - 方向步进
         auto_row = ttk.Frame(frame)
-        auto_row.grid(row=7, column=0, columnspan=7, sticky="w", pady=2)
+        auto_row.grid(row=7, column=0, columnspan=7, sticky="w", pady=(12, 2))
         ttk.Label(auto_row, text="自动X轴循环:").pack(side="left", padx=4)
         ttk.Label(auto_row, text="次数:").pack(side="left")
         self.cycle_var = tk.StringVar(value="1")
@@ -325,11 +331,7 @@ class MainWindow(tk.Tk):
         self.ystep_var = tk.StringVar(value="10")
         self.ystep_entry = ttk.Entry(auto_row, textvariable=self.ystep_var, width=5)
         self.ystep_entry.pack(side="left", padx=2)
-        start_btn = ttk.Button(auto_row, text="开始", width=8, command=self._start_auto)
-        start_btn.pack(side="left", padx=4)
-        self.auto_widgets += [start_btn, self.cycle_entry, self.ystep_entry]
-        # 停止按钮始终可用（手动急停出口）
-        ttk.Button(auto_row, text="停止", width=8, command=self._stop_auto).pack(side="left", padx=4)
+        self.auto_widgets += [self.cycle_entry, self.ystep_entry]
         self.cycle_info_var = tk.StringVar(value="")
 
         # 大循环：整组 X-Y 循环重复的次数，组间 Y 回到起始位置
@@ -343,13 +345,26 @@ class MainWindow(tk.Tk):
                   foreground="gray").pack(side="left", padx=8)
         self.auto_widgets.append(self.outer_entry)
 
+        # 开始/停止按钮独立一行（大循环次数下方）
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=9, column=0, columnspan=7, sticky="w", pady=(6, 2))
+        start_btn = tk.Button(btn_row, text="开始", width=8, bg="#2e7d32", fg="white",
+                              font=("", 10, "bold"), activebackground="#388e3c",
+                              command=self._start_auto)
+        start_btn.pack(side="left", padx=4)
+        self.auto_widgets.append(start_btn)
+        # 停止按钮始终可用（手动急停出口）
+        tk.Button(btn_row, text="停止", width=8, bg="#c62828", fg="white",
+                  font=("", 10, "bold"), activebackground="#d32f2f",
+                  command=self._stop_auto).pack(side="left", padx=4)
+
         # 循环状态显示（独立一行，避免超出窗口）
         ttk.Label(frame, textvariable=self.cycle_info_var,
-                  foreground="gray").grid(row=9, column=0, columnspan=7)
+                  foreground="gray").grid(row=10, column=0, columnspan=7)
 
         self.last_report_var = tk.StringVar(value="等待设备上报...")
         ttk.Label(frame, textvariable=self.last_report_var,
-                  foreground="gray").grid(row=10, column=0, columnspan=7, pady=6)
+                  foreground="gray").grid(row=11, column=0, columnspan=7, pady=6)
 
     def _build_device_frame(self):
         frame = ttk.LabelFrame(self, text="设备控制")
