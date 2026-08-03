@@ -7,8 +7,11 @@
   滚子:    G (状态翻转)
 设备每隔几秒主动上报状态帧，例如：
   POS:X=+014.88,Y=+000.00,Z=+000.00,D=0,G=0
-行程范围: X [-38, 232]  Y [-7, 123]  Z [-65, 119.5]
-多条指令间隔 >= 50ms（程序内置发送队列自动保证）
+ 行程范围: X [-38, 232]  Y [-7, 123]  Z [-65, 119.5]
+ 多条指令间隔 >= 50ms（程序内置发送队列自动保证）
+
+附加：扫描服务器连接（127.0.0.1:19090），仅建连并显示状态。
+  连接成功后服务器发送: NETSCAN_SERVER_READY
 """
 
 import ctypes
@@ -27,6 +30,15 @@ DEFAULT_HOST = "192.168.1.88"
 DEFAULT_PORT = 2001
 MIN_INTERVAL = 0.05  # 指令最小间隔 50ms
 POS_TOLERANCE = 0.1  # 判定到达目标位置的容差
+
+# 扫描服务器连接
+SCAN_HOST = "127.0.0.1"
+SCAN_PORT = 19090
+SCAN_READY = "NETSCAN_SERVER_READY"  # 连接成功后服务器发送的就绪帧
+CMD_FLASH = "FLASH"                  # 闪喷命令
+FLASH_ACCEPTED = "OK FLASH_ACCEPTED" # 闪喷命令成功接受回复
+FLASH_PAUSE_MS = 2000                # 维护闪喷时在终点暂停的时长
+DEFAULT_FLASH_INTERVAL = 10          # 默认闪喷间隔（X 到达终点的次数）
 
 AXIS_LIMITS = {
     "X": (-10.0, 230.0),
@@ -183,6 +195,88 @@ class TcpSender:
                 return
 
 
+# ---------- 扫描服务器连接 ----------
+
+class ScanClient:
+    """与扫描服务器建连（127.0.0.1:19090），显示连接/就绪状态并收发命令"""
+
+    def __init__(self, on_state_change, on_ready, on_response):
+        self.sock = None
+        self.connected = False
+        self.ready = False
+        self.on_state_change = on_state_change  # func(bool, str)
+        self.on_ready = on_ready                # func() 收到就绪帧
+        self.on_response = on_response          # func(str) 收到一行回复
+
+    def connect(self, host: str, port: int) -> bool:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            sock.connect((host, port))
+            sock.settimeout(0.5)
+            self.sock = sock
+            self.connected = True
+            self.on_state_change(True, f"扫描服务器已连接 {host}:{port}")
+            threading.Thread(target=self._recv_loop, daemon=True).start()
+            return True
+        except Exception as e:
+            self.on_state_change(False, f"扫描服务器连接失败: {e}")
+            return False
+
+    def disconnect(self):
+        self.connected = False
+        self.ready = False
+        sock, self.sock = self.sock, None
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self.on_state_change(False, "扫描服务器已断开")
+
+    def send(self, data: str):
+        """发送原始命令（调用方自行带 \r\n）"""
+        sock = self.sock
+        if sock is None or not self.connected:
+            self.on_state_change(False, "扫描服务器未连接，命令未发送")
+            return False
+        try:
+            sock.sendall(data.encode("ascii"))
+            return True
+        except OSError as e:
+            self.on_state_change(False, f"扫描服务器发送失败: {e}")
+            self.disconnect()
+            return False
+
+    def _recv_loop(self):
+        buffer = ""
+        while True:
+            sock = self.sock
+            if sock is None or not self.connected:
+                return
+            try:
+                data = sock.recv(4096)
+                if not data:
+                    self.disconnect()
+                    return
+                buffer += data.decode("ascii", errors="replace")
+                if not self.ready and SCAN_READY in buffer:
+                    self.ready = True
+                    self.on_ready()
+                # 按行分割，逐行回调
+                while "\r\n" in buffer or "\n" in buffer:
+                    line, _, rest = buffer.partition("\n")
+                    buffer = rest
+                    line = line.rstrip("\r")
+                    if line.strip():
+                        self.on_response(line)
+            except socket.timeout:
+                continue
+            except OSError:
+                self.disconnect()
+                return
+
+
 # ---------- 主窗口 ----------
 
 class MainWindow(tk.Tk):
@@ -212,6 +306,11 @@ class MainWindow(tk.Tk):
         self._auto_leg = "end"     # 当前段: "end"/"home"/"ystep"/"yback"
         self._auto_ystep = 10.0    # 循环间 Y 轴负向步进量
         self._uv_dist = 120.0      # UV 灯开灯的 X 位置（水平距离）
+        # 打印中维护闪喷：X 到达终点累计计数（不管 Y step / 大循环，一直累加）
+        self._flash_count = 0      # X 到达终点累计次数
+        self._flash_interval = DEFAULT_FLASH_INTERVAL
+        self._flash_pausing = False  # 是否处于闪喷暂停中
+        self._flash_after = None     # 闪喷恢复定时器 id
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -219,7 +318,14 @@ class MainWindow(tk.Tk):
             on_receive=self._on_status,
         )
 
+        self.scan = ScanClient(
+            on_state_change=self._on_scan_state,
+            on_ready=self._on_scan_ready,
+            on_response=self._on_scan_response,
+        )
+
         self._build_connection_frame()
+        self._build_scan_frame()
         self._build_axis_frame()
         self._build_device_frame()
         self._build_log_frame()
@@ -227,12 +333,14 @@ class MainWindow(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # 启动后自动连接设备
+        # 启动后自动连接设备与扫描服务器
         self.after(300, self._auto_connect)
 
     def _auto_connect(self):
         if not self.sender.connected:
             self._toggle_connect()
+        if not self.scan.connected:
+            self._toggle_scan()
 
     # ---------- UI 构建 ----------
 
@@ -250,6 +358,25 @@ class MainWindow(tk.Tk):
 
         self.connect_btn = ttk.Button(frame, text="连接", command=self._toggle_connect)
         self.connect_btn.grid(row=0, column=4, padx=8)
+
+    def _build_scan_frame(self):
+        frame = ttk.LabelFrame(self, text="打印服务进程")
+        frame.pack(fill="x", padx=8, pady=4)
+
+        ttk.Label(frame, text="IP 地址:").grid(row=0, column=0, padx=4, pady=6)
+        self.scan_ip_var = tk.StringVar(value=SCAN_HOST)
+        ttk.Entry(frame, textvariable=self.scan_ip_var, width=15).grid(row=0, column=1, padx=4)
+
+        ttk.Label(frame, text="端口:").grid(row=0, column=2, padx=4)
+        self.scan_port_var = tk.StringVar(value=str(SCAN_PORT))
+        ttk.Entry(frame, textvariable=self.scan_port_var, width=7).grid(row=0, column=3, padx=4)
+
+        self.scan_btn = ttk.Button(frame, text="连接", command=self._toggle_scan)
+        self.scan_btn.grid(row=0, column=4, padx=8)
+
+        self.scan_ready_var = tk.StringVar(value="未连接")
+        ttk.Label(frame, textvariable=self.scan_ready_var,
+                  foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w", padx=4, pady=2)
 
     def _build_axis_frame(self):
         frame = ttk.LabelFrame(self, text="轴控制（位置来自设备周期性上报）")
@@ -322,7 +449,7 @@ class MainWindow(tk.Tk):
         # 自动循环：X 在起始/终点之间往返，循环之间 Y 轴向 - 方向步进
         auto_row = ttk.Frame(frame)
         auto_row.grid(row=7, column=0, columnspan=7, sticky="w", pady=(12, 2))
-        ttk.Label(auto_row, text="自动X轴循环:").pack(side="left", padx=4)
+        ttk.Label(auto_row, text="自动打印循环:").pack(side="left", padx=4)
         ttk.Label(auto_row, text="次数:").pack(side="left")
         self.cycle_var = tk.StringVar(value="1")
         self.cycle_entry = ttk.Entry(auto_row, textvariable=self.cycle_var, width=5)
@@ -379,6 +506,9 @@ class MainWindow(tk.Tk):
         self.roller_btn = ttk.Button(row1, text="滚子: 停止", width=16, command=self._toggle_roller)
         self.roller_btn.pack(side="left", padx=16, pady=8)
 
+        self.flash_btn = ttk.Button(row1, text="闪喷", width=16, command=self._send_flash)
+        self.flash_btn.pack(side="left", padx=16, pady=8)
+
         # 急停按钮始终可用（用 tk.Button 以便着色）
         self.estop_btn = tk.Button(row1, text="急停", width=10,
                                    bg="#d32f2f", fg="white",
@@ -395,6 +525,16 @@ class MainWindow(tk.Tk):
         self.auto_uv_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row2, text="自动UV灯", variable=self.auto_uv_var,
                         command=self._auto_uv_toggled).pack(side="left", padx=16)
+
+        # 打印中维护闪喷：自动循环中 X 到达终点累计计数，达间隔时暂停闪喷
+        row3 = ttk.Frame(frame)
+        row3.pack(fill="x")
+        self.flash_maintain_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row3, text="打印中维护闪喷", variable=self.flash_maintain_var
+                        ).pack(side="left", padx=(16, 2), pady=4)
+        ttk.Label(row3, text="闪喷间隔:").pack(side="left", padx=(16, 2))
+        self.flash_interval_var = tk.StringVar(value=str(DEFAULT_FLASH_INTERVAL))
+        ttk.Entry(row3, textvariable=self.flash_interval_var, width=8).pack(side="left", padx=2)
 
     def _build_log_frame(self):
         from tkinter import scrolledtext
@@ -425,6 +565,53 @@ class MainWindow(tk.Tk):
                 return
             threading.Thread(target=self.sender.connect,
                              args=(host, port), daemon=True).start()
+
+    def _toggle_scan(self):
+        if self.scan.connected:
+            self.scan.disconnect()
+        else:
+            host = self.scan_ip_var.get().strip()
+            try:
+                port = int(self.scan_port_var.get().strip())
+            except ValueError:
+                messagebox.showerror("错误", "端口必须是数字")
+                return
+            threading.Thread(target=self.scan.connect,
+                             args=(host, port), daemon=True).start()
+
+    # ---------- 扫描服务器回调 ----------
+
+    def _on_scan_state(self, connected: bool, msg: str):
+        def update():
+            self.status_var.set(msg)
+            self.scan_btn.config(text="断开" if connected else "连接")
+            self.scan_ready_var.set("等待就绪帧..." if connected else "未连接")
+            self._append_log(f"[扫描] {msg}\n")
+        self.after(0, update)
+
+    def _on_scan_ready(self):
+        def update():
+            self.scan_ready_var.set("就绪 (NETSCAN_SERVER_READY)")
+            self._append_log("[扫描] 收到就绪帧: NETSCAN_SERVER_READY\n")
+        self.after(0, update)
+
+    def _send_flash(self):
+        """发送闪喷命令 FLASH\r\n 到扫描服务器"""
+        if not self.scan.connected:
+            messagebox.showwarning("提示", "扫描服务器未连接")
+            return
+        if self.scan.send(f"{CMD_FLASH}\r\n"):
+            self._append_log(f"[闪喷] 发送: {CMD_FLASH}\r\n")
+            self.status_var.set("闪喷命令已发送，等待回复...")
+
+    def _on_scan_response(self, line: str):
+        def update():
+            self._append_log(f"[扫描回复] {line}\n")
+            if FLASH_ACCEPTED in line:
+                self.status_var.set(f"闪喷已接受: {FLASH_ACCEPTED}")
+            elif line.startswith("未知命令"):
+                self.status_var.set(f"闪喷回复（未知命令）: {line}")
+        self.after(0, update)
 
     # ---------- 轴控制 ----------
 
@@ -572,6 +759,19 @@ class MainWindow(tk.Tk):
                 return
             uv_dist = X_END  # 未启用自动UV灯时该值无意义
         self._uv_dist = uv_dist
+        if self.flash_maintain_var.get():
+            try:
+                flash_int = int(self.flash_interval_var.get().strip())
+                if flash_int < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("错误", "闪喷间隔必须是正整数")
+                return
+        else:
+            flash_int = DEFAULT_FLASH_INTERVAL
+        self._flash_interval = flash_int
+        self._flash_count = 0
+        self._cancel_flash_pause()
         self._auto_ystep = ystep
         self._inner_total = count
         self._auto_remaining = count
@@ -597,6 +797,7 @@ class MainWindow(tk.Tk):
         self._auto_active = False
         self._outer_remaining = 0
         self._pending.clear()
+        self._cancel_flash_pause()
         self._unlock_auto_group()
         self.cycle_info_var.set("")
         if self.auto_uv_var.get():
@@ -608,12 +809,40 @@ class MainWindow(tk.Tk):
         self._auto_active = False
         self._outer_remaining = 0
         self._pending.clear()
+        self._cancel_flash_pause()
         self._unlock_auto_group()
         self.cycle_info_var.set("")
         if self.auto_uv_var.get():
             self._set_uv(False)
         self._append_log(f"[自动] 已中止: {reason}\n")
         messagebox.showwarning("自动循环中止", reason)
+
+    def _flash_pause(self):
+        """X 到达终点时暂停循环：发送闪喷命令，2s 后继续返回起始"""
+        self._flash_pausing = True
+        self._append_log(
+            f"[自动] X 到达终点，维护闪喷（间隔 {self._flash_interval}），暂停闪喷\n")
+        self._send_flash()
+        self.status_var.set("闪喷中... 2s 后继续自动循环")
+        self._flash_after = self.after(FLASH_PAUSE_MS, self._flash_resume)
+
+    def _flash_resume(self):
+        """闪喷暂停结束，继续返回起始"""
+        self._flash_after = None
+        self._flash_pausing = False
+        if not self._auto_active:
+            return
+        self._auto_leg = "home"
+        self.sender.send_command(f"X={fmt_pos(X_HOME)}")
+        self._wait_target("X", X_HOME)
+        self._auto_uv_update()
+
+    def _cancel_flash_pause(self):
+        """取消未执行的闪喷恢复定时器（停止/中止/急停时调用）"""
+        if self._flash_after is not None:
+            self.after_cancel(self._flash_after)
+            self._flash_after = None
+        self._flash_pausing = False
 
     def _auto_advance(self) -> bool:
         """一段到达后推进自动循环，返回 True 表示已发出下一段"""
@@ -624,7 +853,12 @@ class MainWindow(tk.Tk):
             self._wait_target("X", X_END)
             return True
         if self._auto_leg == "end":
-            # 到达终点 -> 返回起始
+            # 到达终点 -> 计数；启用维护闪喷且达间隔时，先暂停闪喷再返回起始
+            self._flash_count += 1
+            if self.flash_maintain_var.get() and self._flash_count >= self._flash_interval:
+                self._flash_count = 0
+                self._flash_pause()
+                return True
             self._auto_leg = "home"
             self.sender.send_command(f"X={fmt_pos(X_HOME)}")
             self._wait_target("X", X_HOME)
@@ -747,6 +981,7 @@ class MainWindow(tk.Tk):
         self._auto_active = False
         self._outer_remaining = 0
         self._pending.clear()
+        self._cancel_flash_pause()
         self.cycle_info_var.set("")
         self._unlock_all()
         if self.auto_uv_var.get():
@@ -791,6 +1026,7 @@ class MainWindow(tk.Tk):
                 self._pending.clear()
                 self._auto_active = False
                 self._outer_remaining = 0
+                self._cancel_flash_pause()
                 self.cycle_info_var.set("")
                 self._unlock_all()
         self.after(0, update)
@@ -808,6 +1044,7 @@ class MainWindow(tk.Tk):
 
     def _on_close(self):
         self.sender.disconnect()
+        self.scan.disconnect()
         self.destroy()
 
 
