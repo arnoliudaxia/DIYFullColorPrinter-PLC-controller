@@ -409,7 +409,7 @@ class MainWindow(tk.Tk):
         step_bar.grid(row=0, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(step_bar, text="点动步长:").pack(side="left", padx=4)
         self.step_var = tk.StringVar(value="1")
-        for v in (1, 5, 10):
+        for v in (1, 5, 10, 50):
             tk.Radiobutton(step_bar, text=str(v), variable=self.step_var, value=str(v),
                            indicatoron=False, width=4,
                            selectcolor="#2e86de",        # 选中时底色（蓝色突出）
@@ -439,10 +439,15 @@ class MainWindow(tk.Tk):
 
             jog_minus = ttk.Button(frame, text=JOG_LABELS[axis][0], width=6,
                                    command=lambda a=axis: self._jog(a, -1))
-            jog_minus.grid(row=row, column=4, padx=2)
             jog_plus = ttk.Button(frame, text=JOG_LABELS[axis][1], width=6,
                                   command=lambda a=axis: self._jog(a, 1))
-            jog_plus.grid(row=row, column=5, padx=2)
+            if axis == "X":
+                # X 轴点动先显示"左"再"右"（与视觉方向一致）
+                jog_plus.grid(row=row, column=4, padx=2)
+                jog_minus.grid(row=row, column=5, padx=2)
+            else:
+                jog_minus.grid(row=row, column=4, padx=2)
+                jog_plus.grid(row=row, column=5, padx=2)
             self.axis_widgets[axis] += [jog_minus, jog_plus]
 
             lo, hi = AXIS_LIMITS[axis]
@@ -452,7 +457,7 @@ class MainWindow(tk.Tk):
         # 快捷位置按钮（X / Z 各一行）
         quick_x = ttk.Frame(frame)
         quick_x.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
-        ttk.Label(quick_x, text="X 轴快捷:").pack(side="left", padx=4)
+        ttk.Label(quick_x, text="X 轴预设:").pack(side="left", padx=4)
         for text, target in [("零点位置 (1)", 1), ("起始位置 (0)", X_HOME), ("终点位置 (220)", X_END)]:
             b = ttk.Button(quick_x, text=text, width=14,
                            command=lambda t=target: self._move_to("X", t))
@@ -472,7 +477,7 @@ class MainWindow(tk.Tk):
         auto_row = ttk.Frame(frame)
         auto_row.grid(row=7, column=0, columnspan=7, sticky="w", pady=(12, 2))
         ttk.Label(auto_row, text="自动打印循环:").pack(side="left", padx=4)
-        ttk.Label(auto_row, text="次数:").pack(side="left")
+        ttk.Label(auto_row, text="PASS数:").pack(side="left")
         self.cycle_var = tk.StringVar(value="1")
         self.cycle_entry = ttk.Entry(auto_row, textvariable=self.cycle_var, width=5)
         self.cycle_entry.pack(side="left", padx=2)
@@ -562,12 +567,12 @@ class MainWindow(tk.Tk):
         # 打印中维护闪喷：自动循环中 X 到达终点累计计数，达间隔时暂停闪喷
         row3 = ttk.Frame(frame)
         row3.pack(fill="x")
-        self.flash_maintain_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row3, text="打印中维护闪喷", variable=self.flash_maintain_var
-                        ).pack(side="left", padx=(16, 2), pady=4)
-        ttk.Label(row3, text="闪喷间隔:").pack(side="left", padx=(16, 2))
+        ttk.Label(row3, text="闪喷间隔:").pack(side="left", padx=(16, 2), pady=4)
         self.flash_interval_var = tk.StringVar(value=str(DEFAULT_FLASH_INTERVAL))
         ttk.Entry(row3, textvariable=self.flash_interval_var, width=8).pack(side="left", padx=2)
+        self.flash_maintain_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row3, text="打印中维护闪喷", variable=self.flash_maintain_var
+                        ).pack(side="left", padx=(16, 2))
 
     def _build_log_frame(self):
         from tkinter import scrolledtext
