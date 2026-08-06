@@ -13,6 +13,9 @@
 附加：扫描服务器连接（127.0.0.1:19090），仅建连并显示状态。
   连接成功后服务器发送: NETSCAN_SERVER_READY
   闪喷命令 FLASH，回复单行: OK FLASH BEFORE=OFF AFTER=ON（回送修改前/后的闪喷状态）
+  压墨命令 PRESS_INK <秒数>，完成回送: OK PRESS_INK SECONDS=.. RESULT=COMPLETED STATE=OFF
+  自动压墨：勾选后在自动循环闪喷前执行 压墨Z下降→PRESS_INK→循环播放warning.mp3并弹窗
+    请手动刮墨→点击确定后 Z 回升→继续闪喷（Z 下降量/压墨时长在 config.toml 配置）
 """
 
 import ctypes
@@ -38,23 +41,160 @@ SCAN_PORT = 19090
 SCAN_READY = "NETSCAN_SERVER_READY"  # 连接成功后服务器发送的就绪帧
 CMD_FLASH = "FLASH"                  # 闪喷命令
 FLASH_ACCEPTED = "OK FLASH_ACCEPTED" # 旧版闪喷接受回复（兼容）
-FLASH_PAUSE_MS = 2000                # 维护闪喷时在终点暂停的时长
 DEFAULT_FLASH_INTERVAL = 10          # 默认闪喷间隔（X 到达终点的次数）
-# X 循环计数到达阈值时 Z 轴下降
-X_CYCLE_COUNT_LIMIT = 200  # X 到达终点累计计数阈值
-X_CYCLE_Z_STEP = 0.5       # 达到阈值时 Z 轴下降量 (mm)
-# 各轴移动速度 (mm/s)，用于预计完成时间
-VX_MMS = 20.0
-VY_MMS = 10.0
-VZ_MMS = 1.0
 # 闪喷回复（机器可解析单行）: OK FLASH BEFORE=OFF AFTER=ON
 FLASH_RESPONSE_PATTERN = re.compile(r"OK FLASH BEFORE=(\w+) AFTER=(\w+)")
 
-AXIS_LIMITS = {
+# ---------- 配置文件 ----------
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
+
+_DEFAULT_AXIS_LIMITS = {
     "X": (-10.0, 230.0),
     "Y": (-5.0, 120.0),
     "Z": (-60.0, 125.0),
 }
+_DEFAULT_X_HOME = 0.0
+_DEFAULT_X_END = 220.0
+
+
+def _load_config() -> dict:
+    """读取 config.toml；缺失或格式错误时返回空 dict（使用默认值）"""
+    try:
+        import tomllib
+        with open(CONFIG_PATH, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, ValueError, ImportError):
+        return {}
+
+
+def _load_axis_limits(cfg: dict) -> dict:
+    limits = dict(_DEFAULT_AXIS_LIMITS)
+    try:
+        for axis, v in cfg["axis_limits"].items():
+            limits[axis.upper()] = (float(v["min"]), float(v["max"]))
+    except (KeyError, TypeError, ValueError):
+        pass
+    return limits
+
+
+def _load_cycle_endpoints(cfg: dict):
+    home, end = _DEFAULT_X_HOME, _DEFAULT_X_END
+    try:
+        home = float(cfg["auto_cycle"]["x_home"])
+        end = float(cfg["auto_cycle"]["x_end"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    return home, end
+
+
+_DEFAULT_JOG_STEPS = (1, 5, 10, 50)
+
+
+def _load_jog_steps(cfg: dict) -> tuple:
+    steps = _DEFAULT_JOG_STEPS
+    try:
+        raw = cfg["jog"]["steps"]
+        parsed = []
+        for s in raw:
+            f = float(s)
+            parsed.append(int(f) if f.is_integer() else f)
+        if not parsed:
+            raise ValueError
+        steps = tuple(parsed)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return steps
+
+
+_DEFAULT_Z_LAYERS = 200   # 默认"200 层 0.5mm"
+_DEFAULT_Z_STEP = 0.5
+
+
+def _load_z_step(cfg: dict):
+    """Z 下降: (触发阈值, 下降量)，阈值由 layers 直接决定"""
+    layers, step = _DEFAULT_Z_LAYERS, _DEFAULT_Z_STEP
+    try:
+        layers = int(float(cfg["z_step"]["layers"]))
+        step = float(cfg["z_step"]["step"])
+        if layers < 1 or step <= 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        pass
+    return layers, step
+
+
+_DEFAULT_FLASH_PAUSE_MS = 2000
+
+
+def _load_flash_pause(cfg: dict) -> int:
+    ms = _DEFAULT_FLASH_PAUSE_MS
+    try:
+        ms = int(float(cfg["flash"]["pause_ms"]))
+        if ms < 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        pass
+    return ms
+
+
+_DEFAULT_PRESS_INK = (2.5, 80.0)  # (压墨秒数, 刮墨时 Z 下降/回升量)
+
+
+def _load_press_ink(cfg: dict):
+    seconds, z_drop = _DEFAULT_PRESS_INK
+    try:
+        seconds = float(cfg["press_ink"]["seconds"])
+        z_drop = float(cfg["press_ink"]["z_drop"])
+        if not (0 < seconds <= 3600) or z_drop <= 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        pass
+    return seconds, z_drop
+
+
+_DEFAULT_SPEEDS = (20.0, 10.0, 1.0)
+
+
+def _load_speeds(cfg: dict):
+    vx, vy, vz = _DEFAULT_SPEEDS
+    try:
+        vx = float(cfg["speeds"]["x"])
+        vy = float(cfg["speeds"]["y"])
+        vz = float(cfg["speeds"]["z"])
+        if min(vx, vy, vz) <= 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        pass
+    return vx, vy, vz
+
+
+_DEFAULT_UI_SCALE = 1.6
+_DEFAULT_WIN_SIZE = (400, 600)
+
+
+def _load_ui(cfg: dict):
+    scale, win = _DEFAULT_UI_SCALE, _DEFAULT_WIN_SIZE
+    try:
+        scale = float(cfg["ui"]["scale"])
+        size = cfg["ui"]["window_size"]
+        win = (int(float(size[0])), int(float(size[1])))
+        if scale <= 0 or min(win) <= 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        pass
+    return scale, win
+
+
+_CONFIG = _load_config()
+AXIS_LIMITS = _load_axis_limits(_CONFIG)
+X_HOME, X_END = _load_cycle_endpoints(_CONFIG)
+JOG_STEPS = _load_jog_steps(_CONFIG)
+X_CYCLE_COUNT_LIMIT, X_CYCLE_Z_STEP = _load_z_step(_CONFIG)
+FLASH_PAUSE_MS = _load_flash_pause(_CONFIG)
+PRESS_INK_SECONDS, PRESS_INK_Z_DROP = _load_press_ink(_CONFIG)
+VX_MMS, VY_MMS, VZ_MMS = _load_speeds(_CONFIG)
+UI_SCALE, WIN_SIZE = _load_ui(_CONFIG)
 
 # 点动按钮文字: {轴: (负方向, 正方向)}，保留正负号
 JOG_LABELS = {
@@ -70,15 +210,9 @@ CMD_ESTOP = "q"  # 急停：打断所有运动指令
 # 自动循环全部完成后的提示音
 FINISH_SOUND = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "assets", "freesound_community-goodresult-82807.mp3")
-
-# UI 整体缩放系数（>=1.0 放大；所有字体、控件、间距随之等比例放大）
-UI_SCALE = 1.6
-# 窗口尺寸（宽, 高），按缩放系数放大
-WIN_SIZE = (400, 600)
-
-# X 轴快捷/自动循环的两个端点
-X_HOME = 0.0   # 起始位置
-X_END = 220.0  # 终点位置
+# 自动压墨时循环播放的警告音
+INK_WARNING_SOUND = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "assets", "warning.mp3")
 
 # 状态帧: POS:X=+014.88,Y=+000.00,Z=+000.00,D=0,G=0
 STATUS_PATTERN = re.compile(
@@ -404,12 +538,12 @@ class MainWindow(tk.Tk):
         frame = ttk.LabelFrame(self, text="轴控制（位置来自设备周期性上报）")
         frame.pack(fill="x", padx=8, pady=4)
 
-        # 共享点动步长：不可手动输入，通过 1/5/10 单选按钮切换，选中按钮呈按下状态
+        # 共享点动步长：不可手动输入，通过单选按钮切换（选项来自 config.toml）
         step_bar = ttk.Frame(frame)
         step_bar.grid(row=0, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(step_bar, text="点动步长:").pack(side="left", padx=4)
-        self.step_var = tk.StringVar(value="1")
-        for v in (1, 5, 10, 50):
+        self.step_var = tk.StringVar(value=fmt_pos(JOG_STEPS[0]))
+        for v in JOG_STEPS:
             tk.Radiobutton(step_bar, text=str(v), variable=self.step_var, value=str(v),
                            indicatoron=False, width=4,
                            selectcolor="#2e86de",        # 选中时底色（蓝色突出）
@@ -458,7 +592,9 @@ class MainWindow(tk.Tk):
         quick_x = ttk.Frame(frame)
         quick_x.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_x, text="X 轴预设:").pack(side="left", padx=4)
-        for text, target in [("零点位置 (1)", 1), ("起始位置 (0)", X_HOME), ("终点位置 (220)", X_END)]:
+        for text, target in [("零点位置 (1)", 1),
+                             (f"起始位置 ({fmt_pos(X_HOME)})", X_HOME),
+                             (f"终点位置 ({fmt_pos(X_END)})", X_END)]:
             b = ttk.Button(quick_x, text=text, width=14,
                            command=lambda t=target: self._move_to("X", t))
             b.pack(side="left", padx=4)
@@ -537,22 +673,21 @@ class MainWindow(tk.Tk):
         self.roller_btn = ttk.Button(row1, text="滚子: 停止", width=16, command=self._toggle_roller)
         self.roller_btn.pack(side="left", padx=16, pady=8)
 
-        self.flash_btn = ttk.Button(row1, text="闪喷", width=16, command=self._send_flash)
-        self.flash_btn.pack(side="left", padx=16, pady=8)
-
-        # 闪喷状态指示（只读，随服务器回送 BEFORE/AFTER 同步）
-        self.flash_state_var = tk.BooleanVar(value=False)
-        self.flash_state_cb = ttk.Checkbutton(row1, text="闪喷状态",
-                                              variable=self.flash_state_var,
-                                              state="disabled")
-        self.flash_state_cb.pack(side="left", padx=16, pady=8)
-
         # 急停按钮始终可用（用 tk.Button 以便着色）
         self.estop_btn = tk.Button(row1, text="急停", width=10,
                                    bg="#d32f2f", fg="white",
                                    font=("", 11, "bold"),
                                    command=self._emergency_stop)
         self.estop_btn.pack(side="left", padx=16, pady=8)
+
+        # 闪喷 / 压墨 按钮独立一行
+        row1b = ttk.Frame(frame)
+        row1b.pack(fill="x")
+        self.flash_btn = ttk.Button(row1b, text="闪喷: 关", width=16, command=self._send_flash)
+        self.flash_btn.pack(side="left", padx=16, pady=8)
+        self.press_ink_btn = ttk.Button(row1b, text="压墨", width=16,
+                                        command=self._send_press_ink)
+        self.press_ink_btn.pack(side="left", padx=16, pady=8)
 
         row2 = ttk.Frame(frame)
         row2.pack(fill="x")
@@ -573,6 +708,15 @@ class MainWindow(tk.Tk):
         self.flash_maintain_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row3, text="打印中维护闪喷", variable=self.flash_maintain_var
                         ).pack(side="left", padx=(16, 2))
+
+        # 自动压墨：勾选后在自动循环的闪喷前执行压墨
+        row4 = ttk.Frame(frame)
+        row4.pack(fill="x")
+        self.press_ink_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4, text="打印中自动压墨", variable=self.press_ink_var
+                        ).pack(side="left", padx=(16, 2), pady=4)
+        ttk.Label(row4, text=f"(时长 {fmt_pos(PRESS_INK_SECONDS)}s)",
+                  foreground="gray").pack(side="left", padx=2)
 
     def _build_log_frame(self):
         from tkinter import scrolledtext
@@ -621,7 +765,6 @@ class MainWindow(tk.Tk):
 
     def _on_scan_state(self, connected: bool, msg: str):
         def update():
-            self.status_var.set(msg)
             self.scan_btn.config(text="断开" if connected else "连接")
             self.scan_ready_var.set("等待就绪帧..." if connected else "未连接")
             self._append_log(f"[扫描] {msg}\n")
@@ -640,17 +783,28 @@ class MainWindow(tk.Tk):
             return
         if self.scan.send(f"{CMD_FLASH}\r\n"):
             self._append_log(f"[闪喷] 发送: {CMD_FLASH}\r\n")
-            self.status_var.set("闪喷命令已发送，等待回复...")
+
+    def _send_press_ink(self):
+        """手动发送压墨命令 PRESS_INK <秒数>\r\n 到扫描服务器"""
+        if not self.scan.connected:
+            messagebox.showwarning("提示", "扫描服务器未连接")
+            return
+        if self.scan.send(f"PRESS_INK {fmt_pos(PRESS_INK_SECONDS)}\r\n"):
+            self._append_log(f"[压墨] 发送: PRESS_INK {fmt_pos(PRESS_INK_SECONDS)}\r\n")
 
     def _on_scan_response(self, line: str):
         def update():
             self._append_log(f"[扫描回复] {line}\n")
+            if "PRESS_INK" in line:
+                # 压墨完成/结果回送，仅记录日志
+                self._append_log(f"[压墨] {line}\n")
+                return
             m = FLASH_RESPONSE_PATTERN.fullmatch(line.strip())
             if m:
                 before, after = m.group(1), m.group(2)
                 self.flash_on = after == "ON"
-                self.flash_state_var.set(self.flash_on)
-                self.status_var.set(f"闪喷状态: {before} -> {after}")
+                self.flash_btn.config(text=f"闪喷: {'开' if self.flash_on else '关'}")
+                self._append_log(f"[闪喷] 状态: {before} -> {after}\n")
                 if self._flash_wait_off and not self.flash_on:
                     # 结束闪喷已确认关闭，继续移动 X
                     if self._flash_wait_after is not None:
@@ -660,9 +814,9 @@ class MainWindow(tk.Tk):
                     self._append_log("[自动] 闪喷已结束，继续自动循环\n")
                     self._proceed_after_flash()
             elif FLASH_ACCEPTED in line:
-                self.status_var.set(f"闪喷已接受: {FLASH_ACCEPTED}")
+                self._append_log(f"[闪喷] 已接受: {FLASH_ACCEPTED}\n")
             elif line.startswith("未知命令"):
-                self.status_var.set(f"闪喷回复（未知命令）: {line}")
+                self._append_log(f"[闪喷] 未知命令回复: {line}\n")
         self.after(0, update)
 
     # ---------- 轴控制 ----------
@@ -787,7 +941,10 @@ class MainWindow(tk.Tk):
         z_time = (total_x // X_CYCLE_COUNT_LIMIT) * X_CYCLE_Z_STEP / VZ_MMS
         t = x_dist / VX_MMS + y_dist / VY_MMS + z_time
         if self.flash_maintain_var.get():
-            t += (total_x // self._flash_interval) * (FLASH_PAUSE_MS / 1000.0)
+            flashes = total_x // self._flash_interval
+            t += flashes * (FLASH_PAUSE_MS / 1000.0)
+            if self.press_ink_var.get():
+                t += flashes * PRESS_INK_SECONDS
         return t
 
     def _start_auto(self):
@@ -890,10 +1047,76 @@ class MainWindow(tk.Tk):
         messagebox.showwarning("自动循环中止", reason)
 
     def _flash_pause(self):
-        """X 到达终点时暂停循环：发送闪喷命令，2s 后结束闪喷再继续"""
+        """X 到达终点时暂停循环：先压墨（若启用），再闪喷"""
         self._flash_pausing = True
         self._append_log(
-            f"[自动] X 到达终点，维护闪喷（间隔 {self._flash_interval}），暂停闪喷\n")
+            f"[自动] X 到达终点，维护闪喷（间隔 {self._flash_interval}），暂停\n")
+        if self.press_ink_var.get():
+            # 1. Z 下降
+            self._z_drop_for_ink()
+            # 2. 发送压墨命令
+            self._append_log(
+                f"[自动] 发送压墨命令 PRESS_INK {fmt_pos(PRESS_INK_SECONDS)}\n")
+            self.scan.send(f"PRESS_INK {fmt_pos(PRESS_INK_SECONDS)}\r\n")
+            # 3. 循环警告音 + 弹窗等待手动刮墨
+            self._play_ink_warning_loop()
+            self.status_var.set("请手动刮墨...")
+            messagebox.showinfo("请手动刮墨", "请手动刮墨，完成后点击确定")
+            # 4. 关闭警告音，Z 回升，继续闪喷
+            self._stop_ink_warning()
+            self._z_rise_for_ink()
+        self._do_flash_pause()
+
+    def _z_drop_for_ink(self):
+        """刮墨前 Z 轴下降（增量指令，带行程校验）"""
+        target = self.positions["Z"] - PRESS_INK_Z_DROP
+        if not (AXIS_LIMITS["Z"][0] <= target <= AXIS_LIMITS["Z"][1]):
+            self._append_log(
+                f"[自动] 压墨 Z 下降超出行程，跳过: 目标 {fmt_pos(target)}\n")
+            return
+        self.sender.send_command(f"Z-{fmt_pos(PRESS_INK_Z_DROP)}")
+        self._append_log(
+            f"[自动] 压墨 Z 下降 {fmt_pos(PRESS_INK_Z_DROP)} -> {fmt_pos(target)}\n")
+
+    def _z_rise_for_ink(self):
+        """刮墨完成后 Z 轴回升（增量指令，带行程校验）"""
+        target = self.positions["Z"] + PRESS_INK_Z_DROP
+        if not (AXIS_LIMITS["Z"][0] <= target <= AXIS_LIMITS["Z"][1]):
+            self._append_log(
+                f"[自动] 压墨 Z 回升超出行程，跳过: 目标 {fmt_pos(target)}\n")
+            return
+        self.sender.send_command(f"Z+{fmt_pos(PRESS_INK_Z_DROP)}")
+        self._append_log(
+            f"[自动] 压墨 Z 回升 {fmt_pos(PRESS_INK_Z_DROP)} -> {fmt_pos(target)}\n")
+
+    def _play_ink_warning_loop(self):
+        """循环播放 assets/warning.mp3（MCI，不阻塞）"""
+        try:
+            winmm = ctypes.windll.winmm
+            alias = "ink_warning"
+            winmm.mciSendStringW(f"stop {alias}", None, 0, None)
+            winmm.mciSendStringW(f"close {alias}", None, 0, None)
+            if winmm.mciSendStringW(f'open "{INK_WARNING_SOUND}" alias {alias}',
+                                    None, 0, None) == 0:
+                winmm.mciSendStringW(f"play {alias} repeat", None, 0, None)
+            else:
+                self._append_log(f"[提示] 警告音效无法播放: {INK_WARNING_SOUND}\n")
+        except Exception as e:
+            self._append_log(f"[提示] 警告音效播放失败: {e}\n")
+
+    def _stop_ink_warning(self):
+        """停止并释放警告音"""
+        try:
+            winmm = ctypes.windll.winmm
+            alias = "ink_warning"
+            winmm.mciSendStringW(f"stop {alias}", None, 0, None)
+            winmm.mciSendStringW(f"close {alias}", None, 0, None)
+        except Exception:
+            pass
+
+    def _do_flash_pause(self):
+        """压墨完成后（或未启用/失败），执行闪喷"""
+        self._append_log("[自动] 暂停闪喷\n")
         self._send_flash()
         self.status_var.set("闪喷中... 2s 后结束闪喷")
         self._flash_after = self.after(FLASH_PAUSE_MS, self._flash_resume)
@@ -931,7 +1154,7 @@ class MainWindow(tk.Tk):
             self._proceed_after_flash()
 
     def _cancel_flash_pause(self):
-        """取消未执行的闪喷定时器（停止/中止/急停/断开时调用）"""
+        """取消未执行的闪喷定时器并停止警告音（停止/中止/急停/断开时调用）"""
         for attr in ("_flash_after", "_flash_wait_after"):
             timer = getattr(self, attr, None)
             if timer is not None:
@@ -939,6 +1162,7 @@ class MainWindow(tk.Tk):
                 setattr(self, attr, None)
         self._flash_pausing = False
         self._flash_wait_off = False
+        self._stop_ink_warning()
 
     def _z_step_down(self):
         """X 循环累计计数达阈值时，Z 轴下降 0.5（不阻塞自动循环）"""

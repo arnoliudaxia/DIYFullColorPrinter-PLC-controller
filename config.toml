@@ -1,0 +1,56 @@
+# 设备远程控制配置
+# 修改后重新启动程序生效；若配置缺失或格式错误，程序使用内置默认值
+
+# 三轴行程范围 (mm)
+[axis_limits]
+[axis_limits.X]
+min = -10.0
+max = 230.0
+
+[axis_limits.Y]
+min = -5.0
+max = 120.0
+
+[axis_limits.Z]
+min = -60.0
+max = 125.0
+
+# 自动循环 X 轴往返端点 (mm)
+# 同时用于 X 轴预设中的"起始位置"/"终点位置"按钮
+[auto_cycle]
+x_home = 0.0
+x_end = 220.0
+
+# 点动步长选项 (mm)，UI 中显示为单选按钮，默认选中第一个
+[jog]
+steps = [1, 5, 10, 50]
+
+# Z 轴下降：每 layers 层（X 到达终点次数）下降 step (mm)
+# 默认即"200 层 0.5mm"；触发阈值由 layers 直接决定
+[z_step]
+layers = 200
+step = 0.5
+
+# 闪喷：维护闪喷时在终点暂停的时长 (ms)
+[flash]
+pause_ms = 2000
+
+# 压墨：勾选"自动压墨"时，自动循环闪喷前执行：
+#   Z 下降 z_drop → 发送 PRESS_INK seconds 秒 → 循环播放 warning.mp3 并弹窗"请手动刮墨"
+#   → 点击确定后 Z 上升 z_drop → 继续闪喷
+# seconds: 压墨时长 (s)，范围 (0, 3600]；z_drop: 刮墨时 Z 轴下降/回升量 (mm)
+[press_ink]
+seconds = 2.5
+z_drop = 80.0
+
+# 各轴移动速度 (mm/s)，用于预计完成时间
+[speeds]
+x = 30.0
+y = 10.0
+z = 1.0
+
+# UI：整体缩放系数、窗口宽高（按缩放系数放大）
+[ui]
+scale = 1.6
+window_size = [400, 600]
+
