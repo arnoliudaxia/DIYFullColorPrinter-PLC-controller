@@ -183,20 +183,24 @@ def _load_speeds(cfg: dict):
 
 
 _DEFAULT_UI_SCALE = 1.6
-_DEFAULT_WIN_SIZE = (400, 600)
+_DEFAULT_WIN_SIZE = (860, 520)
+_DEFAULT_COL_WIDTHS = (420.0, 440.0)  # 两列布局: (左列宽, 右列宽) 逻辑像素
 
 
 def _load_ui(cfg: dict):
     scale, win = _DEFAULT_UI_SCALE, _DEFAULT_WIN_SIZE
+    col_widths = _DEFAULT_COL_WIDTHS
     try:
         scale = float(cfg["ui"]["scale"])
         size = cfg["ui"]["window_size"]
         win = (int(float(size[0])), int(float(size[1])))
-        if scale <= 0 or min(win) <= 0:
+        raw = cfg["ui"]["column_widths"]
+        col_widths = tuple(float(v) for v in raw)
+        if scale <= 0 or min(win) <= 0 or len(col_widths) != 2 or min(col_widths) <= 0:
             raise ValueError
     except (KeyError, TypeError, ValueError):
         pass
-    return scale, win
+    return scale, win, col_widths
 
 
 _CONFIG = _load_config()
@@ -208,7 +212,7 @@ FLASH_PAUSE_MS = _load_flash_pause(_CONFIG)
 PRESS_INK_Z_DROP, PRESS_INK_Z_PRESET = _load_press_ink(_CONFIG)
 PRESS_INK_DURATIONS = _load_press_ink_durations(_CONFIG)
 VX_MMS, VY_MMS, VZ_MMS = _load_speeds(_CONFIG)
-UI_SCALE, WIN_SIZE = _load_ui(_CONFIG)
+UI_SCALE, WIN_SIZE, COL_WIDTHS = _load_ui(_CONFIG)
 
 # 点动按钮文字: {轴: (负方向, 正方向)}，保留正负号
 JOG_LABELS = {
@@ -494,11 +498,23 @@ class MainWindow(tk.Tk):
             on_response=self._on_scan_response,
         )
 
-        self._build_connection_frame()
-        self._build_scan_frame()
-        self._build_axis_frame()
-        self._build_device_frame()
-        self._build_log_frame()
+        # 左右两列布局：左侧连接/服务/设备/日志，右侧轴控制（加宽减高）
+        # 列宽分别由 COL_WIDTHS 控制（minsize，逻辑像素），窗口拉宽时多余宽度给左列
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True)
+        main.grid_rowconfigure(0, weight=1)
+        main.grid_columnconfigure(0, weight=1, minsize=int(COL_WIDTHS[0]))
+        main.grid_columnconfigure(1, weight=0, minsize=int(COL_WIDTHS[1]))
+        left_col = ttk.Frame(main)
+        left_col.grid(row=0, column=0, sticky="nsew")
+        right_col = ttk.Frame(main)
+        right_col.grid(row=0, column=1, sticky="nsew")
+
+        self._build_connection_frame(left_col)
+        self._build_scan_frame(left_col)
+        self._build_device_frame(left_col)
+        self._build_log_frame(left_col)
+        self._build_axis_frame(right_col)
         self._build_status_bar()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -514,8 +530,8 @@ class MainWindow(tk.Tk):
 
     # ---------- UI 构建 ----------
 
-    def _build_connection_frame(self):
-        frame = ttk.LabelFrame(self, text="连接设置")
+    def _build_connection_frame(self, parent):
+        frame = ttk.LabelFrame(parent, text="连接设置")
         frame.pack(fill="x", padx=8, pady=6)
 
         ttk.Label(frame, text="IP 地址:").grid(row=0, column=0, padx=4, pady=6)
@@ -529,8 +545,8 @@ class MainWindow(tk.Tk):
         self.connect_btn = ttk.Button(frame, text="连接", command=self._toggle_connect)
         self.connect_btn.grid(row=0, column=4, padx=8)
 
-    def _build_scan_frame(self):
-        frame = ttk.LabelFrame(self, text="打印服务进程")
+    def _build_scan_frame(self, parent):
+        frame = ttk.LabelFrame(parent, text="打印服务进程")
         frame.pack(fill="x", padx=8, pady=4)
 
         ttk.Label(frame, text="IP 地址:").grid(row=0, column=0, padx=4, pady=6)
@@ -548,9 +564,9 @@ class MainWindow(tk.Tk):
         ttk.Label(frame, textvariable=self.scan_ready_var,
                   foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w", padx=4, pady=2)
 
-    def _build_axis_frame(self):
-        frame = ttk.LabelFrame(self, text="轴控制（位置来自设备周期性上报）")
-        frame.pack(fill="x", padx=8, pady=4)
+    def _build_axis_frame(self, parent):
+        frame = ttk.LabelFrame(parent, text="轴控制（位置来自设备周期性上报）")
+        frame.pack(fill="x", padx=8, pady=4, anchor="n")
 
         # 共享点动步长：不可手动输入，通过单选按钮切换（选项来自 config.toml）
         step_bar = ttk.Frame(frame)
@@ -677,8 +693,8 @@ class MainWindow(tk.Tk):
         ttk.Label(frame, textvariable=self.last_report_var,
                   foreground="gray").grid(row=12, column=0, columnspan=7, pady=6)
 
-    def _build_device_frame(self):
-        frame = ttk.LabelFrame(self, text="设备控制")
+    def _build_device_frame(self, parent):
+        frame = ttk.LabelFrame(parent, text="设备控制")
         frame.pack(fill="x", padx=8, pady=4)
 
         row1 = ttk.Frame(frame)
@@ -748,9 +764,24 @@ class MainWindow(tk.Tk):
         ttk.Label(row4, textvariable=self.press_ink_time_label_var,
                   foreground="gray").pack(side="left", padx=2)
 
-    def _build_log_frame(self):
+        # 自定义指令：用户输入原始指令发送到设备或扫描服务器
+        row5 = ttk.Frame(frame)
+        row5.pack(fill="x")
+        ttk.Label(row5, text="自定义指令:").pack(side="left", padx=(16, 2), pady=4)
+        self.custom_cmd_var = tk.StringVar()
+        cmd_entry = ttk.Entry(row5, textvariable=self.custom_cmd_var, width=20)
+        cmd_entry.pack(side="left", padx=2)
+        cmd_entry.bind("<Return>", lambda e: self._send_custom_cmd())
+        self.custom_target_var = tk.StringVar(value="设备")
+        ttk.Combobox(row5, textvariable=self.custom_target_var,
+                     values=["设备", "扫描服务器"], width=8,
+                     state="readonly").pack(side="left", padx=2)
+        ttk.Button(row5, text="发送", width=6,
+                   command=self._send_custom_cmd).pack(side="left", padx=4)
+
+    def _build_log_frame(self, parent):
         from tkinter import scrolledtext
-        frame = ttk.LabelFrame(self, text="指令日志")
+        frame = ttk.LabelFrame(parent, text="指令日志")
         frame.pack(fill="both", expand=True, padx=8, pady=4)
 
         self.log_text = scrolledtext.ScrolledText(frame, state="disabled",
@@ -818,6 +849,24 @@ class MainWindow(tk.Tk):
         """切换压墨时长预设按钮，更新当前时长"""
         self.press_ink_seconds = float(self.press_ink_time_var.get())
         self.press_ink_time_label_var.set(f"(时长 {fmt_pos(self.press_ink_seconds)}s)")
+
+    def _send_custom_cmd(self):
+        """发送用户输入的自定义指令"""
+        cmd = self.custom_cmd_var.get().strip()
+        if not cmd:
+            return
+        if self.custom_target_var.get() == "扫描服务器":
+            if not self.scan.connected:
+                messagebox.showwarning("提示", "扫描服务器未连接")
+                return
+            if self.scan.send(f"{cmd}\r\n"):
+                self._append_log(f"[自定义] 发送: {cmd}\r\n")
+        else:
+            if not self.sender.connected:
+                messagebox.showwarning("提示", "设备未连接")
+                return
+            self.sender.send_command(cmd)
+            self._append_log(f"[自定义] 发送: {cmd}\r\n")
 
     def _send_press_ink(self):
         """手动发送压墨命令 PRESS_INK <秒数>\r\n 到扫描服务器"""
@@ -1000,10 +1049,10 @@ class MainWindow(tk.Tk):
             return
         try:
             ystep = abs(float(self.ystep_var.get().strip()))
-            if ystep == 0:
+            if round(ystep, 2) != ystep:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("错误", "Y 步进必须是正数")
+            messagebox.showerror("错误", "Y 步进必须是非负数字，最多两位小数")
             return
         if "X" in self._pending or "Y" in self._pending:
             messagebox.showwarning("提示", "X 或 Y 轴正在运动中，请等待到达后再开始自动循环")
@@ -1257,6 +1306,12 @@ class MainWindow(tk.Tk):
         self._update_cycle_info()
         self._append_log(f"[自动] 完成一次内循环，本组剩余 {self._auto_remaining}\n")
         if self._auto_remaining > 0:
+            if self._auto_ystep == 0:
+                # Y 步进为 0：不移动 Y，直接开始下一次内循环
+                self._auto_leg = "end"
+                self.sender.send_command(f"X={fmt_pos(X_END)}")
+                self._wait_target("X", X_END)
+                return True
             # 下一次内循环之前，Y 轴向 - 方向步进
             y_target = self.positions["Y"] - self._auto_ystep
             if not (AXIS_LIMITS["Y"][0] <= y_target <= AXIS_LIMITS["Y"][1]):
