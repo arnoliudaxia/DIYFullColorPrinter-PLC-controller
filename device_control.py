@@ -138,19 +138,32 @@ def _load_flash_pause(cfg: dict) -> int:
     return ms
 
 
-_DEFAULT_PRESS_INK = (2.5, 80.0)  # (压墨秒数, 刮墨时 Z 下降/回升量)
+_DEFAULT_PRESS_INK = (80.0, 70.0)      # (刮墨时 Z 下降/回升量, 压墨高度预设)
+_DEFAULT_PRESS_INK_DURATIONS = (2.0, 5.0, 10.0)  # 压墨时长可选值 (s)
 
 
 def _load_press_ink(cfg: dict):
-    seconds, z_drop = _DEFAULT_PRESS_INK
+    z_drop, press_z = _DEFAULT_PRESS_INK
     try:
-        seconds = float(cfg["press_ink"]["seconds"])
         z_drop = float(cfg["press_ink"]["z_drop"])
-        if not (0 < seconds <= 3600) or z_drop <= 0:
+        press_z = float(cfg["press_ink"]["press_z"])
+        if z_drop <= 0:
             raise ValueError
     except (KeyError, TypeError, ValueError):
         pass
-    return seconds, z_drop
+    return z_drop, press_z
+
+
+def _load_press_ink_durations(cfg: dict) -> tuple:
+    durations = _DEFAULT_PRESS_INK_DURATIONS
+    try:
+        raw = cfg["press_ink"]["durations"]
+        durations = tuple(float(v) for v in raw)
+        if not durations or any(v <= 0 or v > 3600 for v in durations):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        pass
+    return durations
 
 
 _DEFAULT_SPEEDS = (20.0, 10.0, 1.0)
@@ -192,7 +205,8 @@ X_HOME, X_END = _load_cycle_endpoints(_CONFIG)
 JOG_STEPS = _load_jog_steps(_CONFIG)
 X_CYCLE_COUNT_LIMIT, X_CYCLE_Z_STEP = _load_z_step(_CONFIG)
 FLASH_PAUSE_MS = _load_flash_pause(_CONFIG)
-PRESS_INK_SECONDS, PRESS_INK_Z_DROP = _load_press_ink(_CONFIG)
+PRESS_INK_Z_DROP, PRESS_INK_Z_PRESET = _load_press_ink(_CONFIG)
+PRESS_INK_DURATIONS = _load_press_ink_durations(_CONFIG)
 VX_MMS, VY_MMS, VZ_MMS = _load_speeds(_CONFIG)
 UI_SCALE, WIN_SIZE = _load_ui(_CONFIG)
 
@@ -603,7 +617,10 @@ class MainWindow(tk.Tk):
         quick_z = ttk.Frame(frame)
         quick_z.grid(row=6, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_z, text="Z 轴预设:").pack(side="left", padx=4)
-        for text, target in [("打印高度 (125)", 125), ("调试高度 (-10)", -10)]:
+        for text, target in [("打印高度 (125)", 125),
+                             ("调试高度 (-10)", -10),
+                             (f"压墨高度 ({fmt_pos(PRESS_INK_Z_PRESET)})",
+                              PRESS_INK_Z_PRESET)]:
             b = ttk.Button(quick_z, text=text, width=14,
                            command=lambda t=target: self._move_to("Z", t))
             b.pack(side="left", padx=4)
@@ -683,11 +700,22 @@ class MainWindow(tk.Tk):
         # 闪喷 / 压墨 按钮独立一行
         row1b = ttk.Frame(frame)
         row1b.pack(fill="x")
-        self.flash_btn = ttk.Button(row1b, text="闪喷: 关", width=16, command=self._send_flash)
-        self.flash_btn.pack(side="left", padx=16, pady=8)
-        self.press_ink_btn = ttk.Button(row1b, text="压墨", width=16,
+        self.flash_btn = ttk.Button(row1b, text="闪喷: 关", width=14, command=self._send_flash)
+        self.flash_btn.pack(side="left", padx=12, pady=8)
+        self.press_ink_btn = ttk.Button(row1b, text="压墨", width=12,
                                         command=self._send_press_ink)
-        self.press_ink_btn.pack(side="left", padx=16, pady=8)
+        self.press_ink_btn.pack(side="left", padx=(12, 4), pady=8)
+        # 压墨时长预设：类似点动步长的单选按钮（选项来自 config.toml）
+        ttk.Label(row1b, text="时长:").pack(side="left", padx=4, pady=8)
+        self.press_ink_time_var = tk.StringVar(value=fmt_pos(PRESS_INK_DURATIONS[0]))
+        self.press_ink_seconds = float(self.press_ink_time_var.get())
+        for v in PRESS_INK_DURATIONS:
+            tk.Radiobutton(row1b, text=f"{fmt_pos(v)}s", variable=self.press_ink_time_var,
+                           value=fmt_pos(v), indicatoron=False, width=3,
+                           command=self._select_press_ink_time,
+                           selectcolor="#2e86de",        # 选中时底色（蓝色突出）
+                           activebackground="#9ec7f0",   # 悬停底色
+                           font=("", 10, "bold")).pack(side="left", padx=2, pady=8)
 
         row2 = ttk.Frame(frame)
         row2.pack(fill="x")
@@ -715,7 +743,9 @@ class MainWindow(tk.Tk):
         self.press_ink_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row4, text="打印中自动压墨", variable=self.press_ink_var
                         ).pack(side="left", padx=(16, 2), pady=4)
-        ttk.Label(row4, text=f"(时长 {fmt_pos(PRESS_INK_SECONDS)}s)",
+        self.press_ink_time_label_var = tk.StringVar(
+            value=f"(时长 {fmt_pos(PRESS_INK_DURATIONS[0])}s)")
+        ttk.Label(row4, textvariable=self.press_ink_time_label_var,
                   foreground="gray").pack(side="left", padx=2)
 
     def _build_log_frame(self):
@@ -784,13 +814,19 @@ class MainWindow(tk.Tk):
         if self.scan.send(f"{CMD_FLASH}\r\n"):
             self._append_log(f"[闪喷] 发送: {CMD_FLASH}\r\n")
 
+    def _select_press_ink_time(self):
+        """切换压墨时长预设按钮，更新当前时长"""
+        self.press_ink_seconds = float(self.press_ink_time_var.get())
+        self.press_ink_time_label_var.set(f"(时长 {fmt_pos(self.press_ink_seconds)}s)")
+
     def _send_press_ink(self):
         """手动发送压墨命令 PRESS_INK <秒数>\r\n 到扫描服务器"""
         if not self.scan.connected:
             messagebox.showwarning("提示", "扫描服务器未连接")
             return
-        if self.scan.send(f"PRESS_INK {fmt_pos(PRESS_INK_SECONDS)}\r\n"):
-            self._append_log(f"[压墨] 发送: PRESS_INK {fmt_pos(PRESS_INK_SECONDS)}\r\n")
+        seconds = self.press_ink_seconds
+        if self.scan.send(f"PRESS_INK {fmt_pos(seconds)}\r\n"):
+            self._append_log(f"[压墨] 发送: PRESS_INK {fmt_pos(seconds)}\r\n")
 
     def _on_scan_response(self, line: str):
         def update():
@@ -944,7 +980,7 @@ class MainWindow(tk.Tk):
             flashes = total_x // self._flash_interval
             t += flashes * (FLASH_PAUSE_MS / 1000.0)
             if self.press_ink_var.get():
-                t += flashes * PRESS_INK_SECONDS
+                t += flashes * self.press_ink_seconds
         return t
 
     def _start_auto(self):
@@ -1055,9 +1091,10 @@ class MainWindow(tk.Tk):
             # 1. Z 下降
             self._z_drop_for_ink()
             # 2. 发送压墨命令
+            seconds = self.press_ink_seconds
             self._append_log(
-                f"[自动] 发送压墨命令 PRESS_INK {fmt_pos(PRESS_INK_SECONDS)}\n")
-            self.scan.send(f"PRESS_INK {fmt_pos(PRESS_INK_SECONDS)}\r\n")
+                f"[自动] 发送压墨命令 PRESS_INK {fmt_pos(seconds)}\n")
+            self.scan.send(f"PRESS_INK {fmt_pos(seconds)}\r\n")
             # 3. 循环警告音 + 弹窗等待手动刮墨
             self._play_ink_warning_loop()
             self.status_var.set("请手动刮墨...")

@@ -36,12 +36,15 @@ step = 0.5
 pause_ms = 2000
 
 # 压墨：勾选"自动压墨"时，自动循环闪喷前执行：
-#   Z 下降 z_drop → 发送 PRESS_INK seconds 秒 → 循环播放 warning.mp3 并弹窗"请手动刮墨"
+#   Z 下降 z_drop → 发送 PRESS_INK <所选时长> 秒 → 循环播放 warning.mp3 并弹窗"请手动刮墨"
 #   → 点击确定后 Z 上升 z_drop → 继续闪喷
-# seconds: 压墨时长 (s)，范围 (0, 3600]；z_drop: 刮墨时 Z 轴下降/回升量 (mm)
+# z_drop: 刮墨时 Z 轴下降/回升量 (mm)
+# durations: 压墨时长可选值 (s)，压墨按钮右侧的预设按钮可切换
+# press_z: Z 轴预设"压墨高度" (mm)，点击 Z 轴预设按钮移动到该高度
 [press_ink]
-seconds = 2.5
 z_drop = 80.0
+durations = [2, 5, 10]
+press_z = 70.0
 
 # 各轴移动速度 (mm/s)，用于预计完成时间
 [speeds]
