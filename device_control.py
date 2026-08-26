@@ -178,6 +178,21 @@ def _load_z_step(cfg: dict):
 _DEFAULT_FLASH_PAUSE_MS = 2000
 
 
+def _load_flash_interval(cfg: dict) -> int:
+    """维护闪喷间隔，单位为累计 X 循环/急停次数。"""
+    interval = DEFAULT_FLASH_INTERVAL
+    try:
+        raw_interval = cfg["flash"]["interval"]
+        if isinstance(raw_interval, bool) or not isinstance(raw_interval, int):
+            raise ValueError
+        interval = raw_interval
+        if interval < 1:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        interval = DEFAULT_FLASH_INTERVAL
+    return interval
+
+
 def _load_flash_pause(cfg: dict) -> int:
     ms = _DEFAULT_FLASH_PAUSE_MS
     try:
@@ -263,6 +278,7 @@ PASS_STOP_WAIT_SECONDS = _load_pass_stop_wait_seconds(_CONFIG)
 PASS_STOP_WAIT_MS = int(round(PASS_STOP_WAIT_SECONDS * 1000))
 JOG_STEPS = _load_jog_steps(_CONFIG)
 X_CYCLE_COUNT_LIMIT, X_CYCLE_Z_STEP = _load_z_step(_CONFIG)
+FLASH_INTERVAL_DEFAULT = _load_flash_interval(_CONFIG)
 FLASH_PAUSE_MS = _load_flash_pause(_CONFIG)
 PRESS_INK_Z_DROP, PRESS_INK_Z_PRESET = _load_press_ink(_CONFIG)
 PRESS_INK_DURATIONS = _load_press_ink_durations(_CONFIG)
@@ -541,7 +557,7 @@ class MainWindow(tk.Tk):
         self._uv_dist = 120.0      # UV 灯开灯的 X 位置（水平距离）
         # 打印中维护闪喷：X 到达终点累计计数（不管 Y step / 大循环，一直累加）
         self._flash_count = 0      # X 到达终点累计次数
-        self._flash_interval = DEFAULT_FLASH_INTERVAL
+        self._flash_interval = FLASH_INTERVAL_DEFAULT
         self._flash_pausing = False   # 是否处于闪喷暂停中
         self._flash_after = None      # 闪喷恢复定时器 id
         self._flash_wait_off = False  # 是否正在等待结束闪喷回送
@@ -550,6 +566,8 @@ class MainWindow(tk.Tk):
         self._x_cycle_count = 0       # X 到达终点累计计数（达阈值清零）
         self._auto_eta = 0.0          # 本次自动循环预计完成时间 (s)
         self.eta_var = tk.StringVar(value="")  # 预计完成时间显示
+        self.auto_count_var = tk.StringVar(
+            value="闪喷计数: 0    X循环计数: 0")
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -711,56 +729,15 @@ class MainWindow(tk.Tk):
             b.pack(side="left", padx=4)
             self.axis_widgets["Z"].append(b)
 
-        # 自动循环：X 在起始/终点之间往返，循环之间 Y 轴向 - 方向步进
-        auto_row = ttk.Frame(frame)
-        auto_row.grid(row=7, column=0, columnspan=7, sticky="w", pady=(12, 2))
-        ttk.Label(auto_row, text="自动打印循环:").pack(side="left", padx=4)
-        ttk.Label(auto_row, text="PASS数:").pack(side="left")
-        self.cycle_var = tk.StringVar(value="1")
-        self.cycle_entry = ttk.Entry(auto_row, textvariable=self.cycle_var, width=5)
-        self.cycle_entry.pack(side="left", padx=2)
-        ttk.Label(auto_row, text="Y 步进:").pack(side="left", padx=(8, 0))
-        self.ystep_var = tk.StringVar(value=fmt_pos(Y_STEP_DEFAULT))
-        self.ystep_entry = ttk.Entry(auto_row, textvariable=self.ystep_var, width=5)
-        self.ystep_entry.pack(side="left", padx=2)
-        self.auto_widgets += [self.cycle_entry, self.ystep_entry]
+        # 服务器事件驱动流程的计数显示。
         self.cycle_info_var = tk.StringVar(value="")
-
-        # 大循环：整组 X-Y 循环重复的次数，组间 Y 回到起始位置
-        outer_row = ttk.Frame(frame)
-        outer_row.grid(row=8, column=0, columnspan=7, sticky="w", pady=2)
-        ttk.Label(outer_row, text="大循环次数:").pack(side="left", padx=4)
-        self.outer_var = tk.StringVar(value="1")
-        self.outer_entry = ttk.Entry(outer_row, textvariable=self.outer_var, width=5)
-        self.outer_entry.pack(side="left", padx=2)
-        ttk.Label(outer_row, text="(每组结束后 Y 回到起始位置再重复)",
-                  foreground="gray").pack(side="left", padx=8)
-        self.auto_widgets.append(self.outer_entry)
-
-        # 开始/停止按钮独立一行（大循环次数下方）
-        btn_row = ttk.Frame(frame)
-        btn_row.grid(row=9, column=0, columnspan=7, sticky="w", pady=(6, 2))
-        start_btn = tk.Button(btn_row, text="开始", width=8, bg="#2e7d32", fg="white",
-                              font=("", 10, "bold"), activebackground="#388e3c",
-                              command=self._start_auto)
-        start_btn.pack(side="left", padx=4)
-        self.auto_widgets.append(start_btn)
-        # 停止按钮始终可用（手动急停出口）
-        tk.Button(btn_row, text="停止", width=8, bg="#c62828", fg="white",
-                  font=("", 10, "bold"), activebackground="#d32f2f",
-                  command=self._stop_auto).pack(side="left", padx=4)
-
-        # 预计完成时间显示
-        ttk.Label(frame, textvariable=self.eta_var,
-                  foreground="#2e7d32").grid(row=10, column=0, columnspan=7, pady=2)
-
-        # 循环状态显示（独立一行，避免超出窗口）
-        ttk.Label(frame, textvariable=self.cycle_info_var,
-                  foreground="gray").grid(row=11, column=0, columnspan=7)
+        self.eta_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.auto_count_var,
+                  foreground="#1565c0").grid(row=7, column=0, columnspan=7, pady=8)
 
         self.last_report_var = tk.StringVar(value="等待设备上报...")
         ttk.Label(frame, textvariable=self.last_report_var,
-                  foreground="gray").grid(row=12, column=0, columnspan=7, pady=6)
+                  foreground="gray").grid(row=8, column=0, columnspan=7, pady=6)
 
     def _build_event_frame(self, parent):
         """socket EVENT 主动事件队列显示区域（轴控制下方）"""
@@ -867,12 +844,9 @@ class MainWindow(tk.Tk):
         # 打印中维护闪喷：自动循环中 X 到达终点累计计数，达间隔时暂停闪喷
         row3 = ttk.Frame(frame)
         row3.pack(fill="x")
-        ttk.Label(row3, text="闪喷间隔:").pack(side="left", padx=(16, 2), pady=4)
-        self.flash_interval_var = tk.StringVar(value=str(DEFAULT_FLASH_INTERVAL))
-        ttk.Entry(row3, textvariable=self.flash_interval_var, width=8).pack(side="left", padx=2)
         self.flash_maintain_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row3, text="打印中维护闪喷", variable=self.flash_maintain_var
-                        ).pack(side="left", padx=(16, 2))
+                        ).pack(side="left", padx=(16, 2), pady=4)
 
         # 自动压墨：勾选后在自动循环的闪喷前执行压墨
         row4 = ttk.Frame(frame)
@@ -1196,22 +1170,10 @@ class MainWindow(tk.Tk):
         self.cycle_info_var.set(
             f"大循环剩余: {self._outer_remaining}，内循环剩余: {self._auto_remaining}")
 
-    def _estimate_auto_time(self, count: int, outer: int, ystep: float) -> float:
-        """按各轴速度估算整次自动循环完成时间（秒）"""
-        total_x = count * outer                       # X 到达终点总次数
-        x_dist = abs(X_END - X_HOME) * 2 * total_x    # 每内循环两次 X 行程
-        x_dist += abs(self.positions["X"] - X_HOME)   # 回起始位置的预移动
-        # Y: 每组内 (count-1) 次步进，组间回到起始位置
-        y_dist = (2 * outer - 1) * (count - 1) * ystep if count > 1 else 0.0
-        # Z: 每 200 次 X 循环下降 0.5
-        z_time = (total_x // X_CYCLE_COUNT_LIMIT) * X_CYCLE_Z_STEP / VZ_MMS
-        t = x_dist / VX_MMS + y_dist / VY_MMS + z_time
-        if self.flash_maintain_var.get():
-            flashes = total_x // self._flash_interval
-            t += flashes * (FLASH_PAUSE_MS / 1000.0)
-            if self.press_ink_var.get():
-                t += flashes * self.press_ink_seconds
-        return t
+    def _update_auto_counts(self):
+        """刷新闪喷计数和 X 循环计数显示。"""
+        self.auto_count_var.set(
+            f"闪喷计数: {self._flash_count}    X循环计数: {self._x_cycle_count}")
 
     def _update_job_progress(self):
         """刷新服务器打印任务的当前层/总层数显示。"""
@@ -1234,6 +1196,7 @@ class MainWindow(tk.Tk):
             return
         self._flash_count = 0
         self._x_cycle_count = 0
+        self._update_auto_counts()
         self._cancel_flash_pause()
         self._auto_active = True
         self._auto_mode = "server"
@@ -1287,7 +1250,7 @@ class MainWindow(tk.Tk):
         self._append_log(
             "[自动] 打印完成，已结束全部流程并清空 Y 初始位置\n")
 
-    def _start_auto(self):
+    def _start_manual_auto(self):
         try:
             count = int(self.cycle_var.get().strip())
             if count < 1:
@@ -1322,19 +1285,11 @@ class MainWindow(tk.Tk):
                 return
             uv_dist = X_END  # 未启用自动UV灯时该值无意义
         self._uv_dist = uv_dist
-        if self.flash_maintain_var.get():
-            try:
-                flash_int = int(self.flash_interval_var.get().strip())
-                if flash_int < 1:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("错误", "闪喷间隔必须是正整数")
-                return
-        else:
-            flash_int = DEFAULT_FLASH_INTERVAL
-        self._flash_interval = flash_int
+        # 闪喷间隔只由 config.toml 的 [flash].interval 配置，不在 UI 修改。
+        self._flash_interval = FLASH_INTERVAL_DEFAULT
         self._flash_count = 0
         self._x_cycle_count = 0
+        self._update_auto_counts()
         self._cancel_flash_pause()
         self._auto_ystep = ystep
         self._inner_total = count
@@ -1360,7 +1315,7 @@ class MainWindow(tk.Tk):
         self._wait_target("X", X_HOME)
         self._auto_uv_update()
 
-    def _stop_auto(self):
+    def _stop_manual_auto(self):
         if not self._auto_active:
             return
         self._auto_active = False
@@ -1482,8 +1437,14 @@ class MainWindow(tk.Tk):
         self._proceed_after_flash()
 
     def _proceed_after_flash(self):
-        """结束闪喷确认后，继续返回起始位置"""
+        """结束闪喷确认后，按手动/服务端任务类型继续对应流程。"""
         if not self._auto_active:
+            return
+        if (self._auto_mode == "server"
+                and self._auto_leg == "server_flash_pause"):
+            self._append_log(
+                "[自动] 维护闪喷完成，开始急停后的配置等待\n")
+            self._start_server_stop_wait()
             return
         self._auto_leg = "home"
         self.sender.send_command(f"X={fmt_pos(X_HOME)}")
@@ -1510,7 +1471,7 @@ class MainWindow(tk.Tk):
         self._stop_ink_warning()
 
     def _z_step_down(self):
-        """X 循环累计计数达阈值时，Z 轴下降 0.5（不阻塞自动循环）"""
+        """X 循环累计计数达阈值时，按配置下降 Z（不阻塞手动循环）。"""
         target = self.positions["Z"] - X_CYCLE_Z_STEP
         if not (AXIS_LIMITS["Z"][0] <= target <= AXIS_LIMITS["Z"][1]):
             self._append_log(
@@ -1520,6 +1481,44 @@ class MainWindow(tk.Tk):
         self._append_log(
             f"[自动] X 循环计数达 {X_CYCLE_COUNT_LIMIT}，"
             f"Z 轴下降 {fmt_pos(X_CYCLE_Z_STEP)} -> {fmt_pos(target)}\n")
+
+    def _start_server_layer_positioning(self):
+        """服务端新层开始时先按 X 循环计数下降 Z，再让 Y 回初始位置。"""
+        if not (self._auto_active and self._auto_mode == "server"):
+            return
+        if self._x_cycle_count >= X_CYCLE_COUNT_LIMIT:
+            target = self.positions["Z"] - X_CYCLE_Z_STEP
+            if not (AXIS_LIMITS["Z"][0] <= target <= AXIS_LIMITS["Z"][1]):
+                self._auto_abort(
+                    f"X 循环计数已达 {self._x_cycle_count}，但 Z 下降目标 "
+                    f"{fmt_pos(target)} 超出行程 "
+                    f"[{fmt_pos(AXIS_LIMITS['Z'][0])}, {fmt_pos(AXIS_LIMITS['Z'][1])}]")
+                return
+            self._auto_leg = "layer_zstep"
+            self.sender.send_command(f"Z-{fmt_pos(X_CYCLE_Z_STEP)}")
+            self._wait_target("Z", target)
+            self._x_cycle_count = 0
+            self._update_auto_counts()
+            self._append_log(
+                f"[自动] 新层开始，X 循环计数达到配置阈值 "
+                f"{X_CYCLE_COUNT_LIMIT}，Z 下降 {fmt_pos(X_CYCLE_Z_STEP)} "
+                f"-> {fmt_pos(target)}，X 循环计数清零\n")
+            self._auto_uv_update()
+            return
+        self._start_server_layer_yhome()
+
+    def _start_server_layer_yhome(self):
+        """服务端新层开始时让 Y 回到任务初始位置并等待到位。"""
+        if not (AXIS_LIMITS["Y"][0] <= self._y_start <= AXIS_LIMITS["Y"][1]):
+            self._auto_abort(
+                f"Y 初始位置 {fmt_pos(self._y_start)} 超出行程")
+            return
+        self._auto_leg = "layer_yhome"
+        self._append_log(
+            f"[自动] 新层开始，Y 移动到初始位置 {fmt_pos(self._y_start)}\n")
+        self.sender.send_command(f"Y={fmt_pos(self._y_start)}")
+        self._wait_target("Y", self._y_start)
+        self._auto_uv_update()
 
     def _begin_layer_motion(self):
         """手动流程收到 LAYER_START 后，从起始位置开始向终点运动。"""
@@ -1649,19 +1648,44 @@ class MainWindow(tk.Tk):
             return False
         self._remove_event(event)
         self._pending.pop("X", None)
-        self._auto_leg = "wait_after_pass_stop"
         self.sender.send_urgent(CMD_ESTOP)
+        # 匹配事件被消费并真正发送 q 时才计数，避免早到、重复或不匹配事件误计。
+        self._flash_count += 1
+        self._x_cycle_count += 1
+        self._update_auto_counts()
         self._auto_uv_update()
-        wait_text = fmt_pos(PASS_STOP_WAIT_SECONDS)
-        self.status_var.set(
-            f"LAYER={layer} PASS={pass_no} 剩余列数为 0，"
-            f"X 已急停，等待 {wait_text} 秒")
         self._append_log(
             f"[自动] LAYER={layer} PASS={pass_no} 剩余列数变为 0，"
-            f"已发送 q 停止 X，等待 {wait_text} 秒\n")
+            f"已发送 q 停止 X；闪喷计数={self._flash_count}，"
+            f"X循环计数={self._x_cycle_count}\n")
+        if (self.flash_maintain_var.get()
+                and self._flash_count >= self._flash_interval):
+            self._flash_count = 0
+            self._update_auto_counts()
+            self._auto_leg = "server_flash_pause"
+            self.status_var.set(
+                f"LAYER={layer} PASS={pass_no} 已急停，达到闪喷间隔，正在维护闪喷")
+            self._append_log(
+                f"[自动] 闪喷计数达到配置间隔 {self._flash_interval}，"
+                "闪喷计数清零并执行维护闪喷\n")
+            self._flash_pause()
+            return True
+        self._start_server_stop_wait()
+        return True
+
+    def _start_server_stop_wait(self):
+        """进入服务端 PASS 急停后的配置等待。"""
+        if not (self._auto_active and self._auto_mode == "server"):
+            return
+        self._auto_leg = "wait_after_pass_stop"
+        wait_text = fmt_pos(PASS_STOP_WAIT_SECONDS)
+        self.status_var.set(
+            f"LAYER={self._active_layer} PASS={self._pass_current} 已急停，"
+            f"等待 {wait_text} 秒")
+        self._append_log(
+            f"[自动] 急停后等待 {wait_text} 秒\n")
         self._server_stop_after = self.after(
             PASS_STOP_WAIT_MS, self._resume_after_pass_stop)
-        return True
 
     def _resume_after_pass_stop(self):
         """每次 PASS 急停后等待配置时长，再完成当前 PASS。"""
@@ -1716,16 +1740,7 @@ class MainWindow(tk.Tk):
                 self._pass_current = 0
                 self._pass_total = 0
                 self._update_pass_progress()
-                if not (AXIS_LIMITS["Y"][0] <= self._y_start <= AXIS_LIMITS["Y"][1]):
-                    self._auto_abort(
-                        f"Y 初始位置 {fmt_pos(self._y_start)} 超出行程")
-                    return
-                self._auto_leg = "layer_yhome"
-                self._append_log(
-                    f"[自动] 新层开始，Y 移动到初始位置 {fmt_pos(self._y_start)}\n")
-                self.sender.send_command(f"Y={fmt_pos(self._y_start)}")
-                self._wait_target("Y", self._y_start)
-                self._auto_uv_update()
+                self._start_server_layer_positioning()
         else:
             self._begin_layer_motion()
 
@@ -1746,6 +1761,10 @@ class MainWindow(tk.Tk):
             return True
         if self._auto_leg == "wait_pass_ready":
             # 等待 PASS_READY 事件触发当前 PASS 的 X 运动
+            return True
+        if self._auto_leg == "layer_zstep":
+            # 达到配置阈值时先等待 Z 下降到位，再让 Y 回到任务初始位置。
+            self._start_server_layer_yhome()
             return True
         if self._auto_leg == "layer_yhome":
             # 每层开始时 Y 回到任务初始位置，到位后再进入 PASS 循环。
@@ -1796,8 +1815,10 @@ class MainWindow(tk.Tk):
                 self._z_step_down()
             if self.flash_maintain_var.get() and self._flash_count >= self._flash_interval:
                 self._flash_count = 0
+                self._update_auto_counts()
                 self._flash_pause()
                 return True
+            self._update_auto_counts()
             self._auto_leg = "home"
             self.sender.send_command(f"X={fmt_pos(X_HOME)}")
             self._wait_target("X", X_HOME)
