@@ -88,6 +88,33 @@ def _load_cycle_endpoints(cfg: dict):
     return home, end
 
 
+_DEFAULT_Y_STEP = 10.0  # Y 步进输入框的默认距离 (mm)
+
+
+def _load_y_step_default(cfg: dict) -> float:
+    """自动循环 Y 步进距离默认值，来自 config.toml y_step"""
+    try:
+        val = float(cfg["auto_cycle"]["y_step"])
+        if val < 0:
+            raise ValueError
+        return val
+    except (KeyError, TypeError, ValueError):
+        return _DEFAULT_Y_STEP
+
+
+def _load_y_step_dir(cfg: dict) -> int:
+    """自动循环 Y 轴步进方向：-1 负向 / +1 正向，来自 config.toml y_step_dir"""
+    try:
+        val = str(cfg["auto_cycle"]["y_step_dir"]).strip()
+        if val in ("+", "1", "正"):
+            return 1
+        if val in ("-", "-1", "负"):
+            return -1
+    except (KeyError, TypeError, ValueError):
+        pass
+    return -1
+
+
 _DEFAULT_JOG_STEPS = (1, 5, 10, 50)
 
 
@@ -206,6 +233,8 @@ def _load_ui(cfg: dict):
 _CONFIG = _load_config()
 AXIS_LIMITS = _load_axis_limits(_CONFIG)
 X_HOME, X_END = _load_cycle_endpoints(_CONFIG)
+Y_STEP_DEFAULT = _load_y_step_default(_CONFIG)  # Y 步进默认距离 (mm)
+Y_STEP_DIR = _load_y_step_dir(_CONFIG)  # 自动循环 Y 轴步进方向 (-1 负 / +1 正)
 JOG_STEPS = _load_jog_steps(_CONFIG)
 X_CYCLE_COUNT_LIMIT, X_CYCLE_Z_STEP = _load_z_step(_CONFIG)
 FLASH_PAUSE_MS = _load_flash_pause(_CONFIG)
@@ -651,7 +680,7 @@ class MainWindow(tk.Tk):
         self.cycle_entry = ttk.Entry(auto_row, textvariable=self.cycle_var, width=5)
         self.cycle_entry.pack(side="left", padx=2)
         ttk.Label(auto_row, text="Y 步进:").pack(side="left", padx=(8, 0))
-        self.ystep_var = tk.StringVar(value="10")
+        self.ystep_var = tk.StringVar(value=fmt_pos(Y_STEP_DEFAULT))
         self.ystep_entry = ttk.Entry(auto_row, textvariable=self.ystep_var, width=5)
         self.ystep_entry.pack(side="left", padx=2)
         self.auto_widgets += [self.cycle_entry, self.ystep_entry]
@@ -1092,7 +1121,8 @@ class MainWindow(tk.Tk):
         self._update_cycle_info()
         self._append_log(
             f"[自动] 开始: 大循环 {outer} 组 x 内循环 {count} 次"
-            f"（X: {fmt_pos(X_HOME)} <-> {fmt_pos(X_END)}，循环间 Y -{fmt_pos(ystep)}，"
+            f"（X: {fmt_pos(X_HOME)} <-> {fmt_pos(X_END)}，循环间 Y "
+            f"{'-' if Y_STEP_DIR < 0 else '+'}{fmt_pos(ystep)}，"
             f"Y 起始位置 {fmt_pos(self._y_start)}）\n")
         self._append_log(f"[自动] 预计完成时间: {fmt_duration(self._auto_eta)}\n")
         self._lock_auto_group()
@@ -1312,16 +1342,18 @@ class MainWindow(tk.Tk):
                 self.sender.send_command(f"X={fmt_pos(X_END)}")
                 self._wait_target("X", X_END)
                 return True
-            # 下一次内循环之前，Y 轴向 - 方向步进
-            y_target = self.positions["Y"] - self._auto_ystep
+            # 下一次内循环之前，Y 轴按配置方向步进
+            y_target = self.positions["Y"] + Y_STEP_DIR * self._auto_ystep
             if not (AXIS_LIMITS["Y"][0] <= y_target <= AXIS_LIMITS["Y"][1]):
                 self._auto_abort(
                     f"Y 步进后目标 {fmt_pos(y_target)} 超出行程 "
                     f"[{fmt_pos(AXIS_LIMITS['Y'][0])}, {fmt_pos(AXIS_LIMITS['Y'][1])}]")
                 return False
             self._auto_leg = "ystep"
-            self._append_log(f"[自动] Y 步进 -{fmt_pos(self._auto_ystep)} -> {fmt_pos(y_target)}\n")
-            self.sender.send_command(f"Y-{fmt_pos(self._auto_ystep)}")
+            sign = "+" if Y_STEP_DIR > 0 else "-"
+            self._append_log(f"[自动] Y 步进 {sign}{fmt_pos(self._auto_ystep)} -> {fmt_pos(y_target)}\n")
+            self.sender.send_command(
+                f"Y{sign}{fmt_pos(self._auto_ystep)}")
             self._wait_target("Y", y_target)
             return True
         # 本组内循环全部完成
