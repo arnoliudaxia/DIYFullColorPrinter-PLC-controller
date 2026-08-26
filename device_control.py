@@ -26,6 +26,7 @@ import socket
 import threading
 import time
 import tkinter as tk
+from collections import deque
 from tkinter import ttk, messagebox
 
 # ---------- 协议常量 ----------
@@ -44,6 +45,15 @@ FLASH_ACCEPTED = "OK FLASH_ACCEPTED" # 旧版闪喷接受回复（兼容）
 DEFAULT_FLASH_INTERVAL = 10          # 默认闪喷间隔（X 到达终点的次数）
 # 闪喷回复（机器可解析单行）: OK FLASH BEFORE=OFF AFTER=ON
 FLASH_RESPONSE_PATTERN = re.compile(r"OK FLASH BEFORE=(\w+) AFTER=(\w+)")
+# 服务器主动事件: 图层开始 / PASS 就绪
+START_JOB_PATTERN = re.compile(r"EVENT START_JOB TOTAL_LAYERS=(\d+)")
+PRINT_JOB_COMPLETED_PATTERN = re.compile(
+    r"EVENT PRINT_JOB_COMPLETED TOTAL_LAYERS=(\d+)")
+LAYER_START_PATTERN = re.compile(r"EVENT LAYER_START LAYER=(\d+)")
+PASS_READY_PATTERN = re.compile(
+    r"EVENT PASS_READY CURRENT=(\d+) TOTAL=(\d+) STEP=([+-]?\d+) EMPTY=(\d+)")
+PASS_REMAINING_ZERO_PATTERN = re.compile(
+    r"EVENT PASS_REMAINING_ZERO LAYER=(\d+) PASS=(\d+) REMAINING=0")
 
 # ---------- 配置文件 ----------
 
@@ -113,6 +123,20 @@ def _load_y_step_dir(cfg: dict) -> int:
     except (KeyError, TypeError, ValueError):
         pass
     return -1
+
+
+_DEFAULT_PASS_STOP_WAIT_SECONDS = 2.0
+
+
+def _load_pass_stop_wait_seconds(cfg: dict) -> float:
+    """PASS 急停后的等待时间（秒），来自 auto_cycle.pass_stop_wait_seconds。"""
+    try:
+        seconds = float(cfg["auto_cycle"]["pass_stop_wait_seconds"])
+        if seconds < 0:
+            raise ValueError
+        return seconds
+    except (KeyError, TypeError, ValueError):
+        return _DEFAULT_PASS_STOP_WAIT_SECONDS
 
 
 _DEFAULT_JOG_STEPS = (1, 5, 10, 50)
@@ -235,6 +259,8 @@ AXIS_LIMITS = _load_axis_limits(_CONFIG)
 X_HOME, X_END = _load_cycle_endpoints(_CONFIG)
 Y_STEP_DEFAULT = _load_y_step_default(_CONFIG)  # Y 步进默认距离 (mm)
 Y_STEP_DIR = _load_y_step_dir(_CONFIG)  # 自动循环 Y 轴步进方向 (-1 负 / +1 正)
+PASS_STOP_WAIT_SECONDS = _load_pass_stop_wait_seconds(_CONFIG)
+PASS_STOP_WAIT_MS = int(round(PASS_STOP_WAIT_SECONDS * 1000))
 JOG_STEPS = _load_jog_steps(_CONFIG)
 X_CYCLE_COUNT_LIMIT, X_CYCLE_Z_STEP = _load_z_step(_CONFIG)
 FLASH_PAUSE_MS = _load_flash_pause(_CONFIG)
@@ -497,10 +523,19 @@ class MainWindow(tk.Tk):
         self.auto_widgets = []
         # X 轴自动循环状态
         self._auto_active = False
+        self._auto_mode = None       # 当前任务来源: "manual" / "server"
         self._auto_remaining = 0   # 本组内剩余循环次数
         self._inner_total = 0      # 每组内循环次数
         self._outer_remaining = 0  # 大循环剩余次数
         self._y_start = 0.0        # 内循环开始时的 Y 位置（大循环间要回到这里）
+        self._job_current_layer = 0
+        self._job_total_layers = 0
+        # 已从事件队列正式消费、当前正在执行 PASS 的层号。
+        # 与 _job_current_layer 分开，后者可能被提前到达的 LAYER_START 更新。
+        self._active_layer = 0
+        self._layer_listening = False
+        self._pass_current = 0
+        self._pass_total = 0
         self._auto_leg = "end"     # 当前段: "end"/"home"/"ystep"/"yback"
         self._auto_ystep = 10.0    # 循环间 Y 轴负向步进量
         self._uv_dist = 120.0      # UV 灯开灯的 X 位置（水平距离）
@@ -511,6 +546,7 @@ class MainWindow(tk.Tk):
         self._flash_after = None      # 闪喷恢复定时器 id
         self._flash_wait_off = False  # 是否正在等待结束闪喷回送
         self._flash_wait_after = None # 结束闪喷回送超时定时器 id
+        self._server_stop_after = None  # 每次 PASS_REMAINING_ZERO 急停后的 2s 等待
         self._x_cycle_count = 0       # X 到达终点累计计数（达阈值清零）
         self._auto_eta = 0.0          # 本次自动循环预计完成时间 (s)
         self.eta_var = tk.StringVar(value="")  # 预计完成时间显示
@@ -526,6 +562,9 @@ class MainWindow(tk.Tk):
             on_ready=self._on_scan_ready,
             on_response=self._on_scan_response,
         )
+
+        # socket EVENT 主动事件队列（服务器广播，保留最近 N 条）
+        self.event_queue = deque(maxlen=200)
 
         # 左右两列布局：左侧连接/服务/设备/日志，右侧轴控制（加宽减高）
         # 列宽分别由 COL_WIDTHS 控制（minsize，逻辑像素），窗口拉宽时多余宽度给左列
@@ -544,6 +583,7 @@ class MainWindow(tk.Tk):
         self._build_device_frame(left_col)
         self._build_log_frame(left_col)
         self._build_axis_frame(right_col)
+        self._build_event_frame(right_col)
         self._build_status_bar()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -721,6 +761,58 @@ class MainWindow(tk.Tk):
         self.last_report_var = tk.StringVar(value="等待设备上报...")
         ttk.Label(frame, textvariable=self.last_report_var,
                   foreground="gray").grid(row=12, column=0, columnspan=7, pady=6)
+
+    def _build_event_frame(self, parent):
+        """socket EVENT 主动事件队列显示区域（轴控制下方）"""
+        frame = ttk.LabelFrame(parent, text="事件队列 (EVENT)")
+        frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+        head = ttk.Frame(frame)
+        head.pack(fill="x", padx=4, pady=2)
+        self.event_count_var = tk.StringVar(value="0 条")
+        ttk.Label(head, text="服务器主动事件（最新在底）：").pack(side="left")
+        ttk.Label(head, textvariable=self.event_count_var,
+                  foreground="gray").pack(side="left", padx=6)
+        self.job_progress_var = tk.StringVar(value="打印进度: 0/0")
+        ttk.Label(head, textvariable=self.job_progress_var,
+                  foreground="#1565c0").pack(side="left", padx=(12, 0))
+        self.pass_progress_var = tk.StringVar(value="PASS进度: 0/0")
+        ttk.Label(head, textvariable=self.pass_progress_var,
+                  foreground="#7b1fa2").pack(side="left", padx=(12, 0))
+        ttk.Button(head, text="清空", width=6,
+                   command=self._clear_event_queue).pack(side="right")
+
+        self.event_list = tk.Listbox(frame, height=8, font=("Consolas", 9),
+                                     exportselection=False)
+        self.event_list.pack(fill="both", expand=True, padx=4, pady=4)
+
+    def _clear_event_queue(self):
+        self.event_queue.clear()
+        self.event_list.delete(0, "end")
+        self.event_count_var.set("0 条")
+
+    def _remove_event(self, fragment: str):
+        """从事件队列中移除包含指定片段的条目并刷新显示"""
+        before = len(self.event_queue)
+        self.event_queue = deque(
+            (ts, ev) for ts, ev in self.event_queue if fragment not in ev)
+        removed = before - len(self.event_queue)
+        if removed:
+            self.event_list.delete(0, "end")
+            for ts, ev in self.event_queue:
+                self.event_list.insert("end", f"[{ts}] {ev}")
+            self.event_list.see("end")
+            self.event_count_var.set(f"{len(self.event_queue)} 条")
+
+    def _enqueue_event(self, line: str):
+        """把服务器主动 EVENT 压入队列并刷新显示"""
+        stamp = time.strftime("%H:%M:%S")
+        self.event_queue.append((stamp, line))
+        self.event_list.delete(0, "end")
+        for ts, ev in self.event_queue:
+            self.event_list.insert("end", f"[{ts}] {ev}")
+        self.event_list.see("end")
+        self.event_count_var.set(f"{len(self.event_queue)} 条")
 
     def _build_device_frame(self, parent):
         frame = ttk.LabelFrame(parent, text="设备控制")
@@ -909,6 +1001,69 @@ class MainWindow(tk.Tk):
     def _on_scan_response(self, line: str):
         def update():
             self._append_log(f"[扫描回复] {line}\n")
+            if line.strip().startswith("EVENT "):
+                # 服务器主动事件：压入事件队列并显示
+                self._enqueue_event(line.strip())
+            m = START_JOB_PATTERN.fullmatch(line.strip())
+            if m:
+                # 服务器事件：启动服务器广播驱动的打印任务（独立逻辑）
+                total_layers = int(m.group(1))
+                self._append_log(
+                    f"[扫描] 收到开始任务事件，总层数 {total_layers}，启动任务循环\n")
+                self._start_job(total_layers)
+                return
+            m = PRINT_JOB_COMPLETED_PATTERN.fullmatch(line.strip())
+            if m:
+                total_layers = int(m.group(1))
+                self._append_log(
+                    f"[扫描] 收到打印完成事件，总层数 {total_layers}\n")
+                if not (self._auto_active and self._auto_mode == "server"):
+                    self._append_log(
+                        "[自动] 当前没有服务器打印任务，忽略打印完成事件\n")
+                    return
+                if total_layers != self._job_total_layers:
+                    self._append_log(
+                        f"[自动] 打印完成事件 TOTAL_LAYERS={total_layers} "
+                        f"与当前任务总层数 {self._job_total_layers} 不一致，忽略\n")
+                    return
+                self._remove_event(line.strip())
+                self._complete_server_job()
+                return
+            m = LAYER_START_PATTERN.match(line.strip())
+            if m:
+                layer = int(m.group(1))
+                self._append_log(f"[图层] LAYER_START LAYER={layer}\n")
+                if (self._auto_active and self._auto_mode == "server"
+                        and self._layer_listening):
+                    if 1 <= layer <= self._job_total_layers:
+                        self._job_current_layer = layer
+                        self._update_job_progress()
+                        if layer == self._job_total_layers:
+                            self._layer_listening = False
+                            self._append_log(
+                                f"[图层] 已监听到最后一层 {layer}/"
+                                f"{self._job_total_layers}\n")
+                    else:
+                        self._append_log(
+                            f"[图层] LAYER={layer} 超出任务总层数 "
+                            f"{self._job_total_layers}，忽略进度更新\n")
+                # 该事件已入队；若起始位置已就位，任意合法层都可以触发向终点运动
+                self._try_start_layer(layer)
+                return
+            m = PASS_READY_PATTERN.match(line.strip())
+            if m:
+                cur, total, step, empty = (int(value) for value in m.groups())
+                self._append_log(
+                    f"[PASS] 就绪 CURRENT={cur} TOTAL={total} STEP={step} EMPTY={empty}\n")
+                self._try_start_pass(line.strip(), cur, total, step, empty)
+                return
+            m = PASS_REMAINING_ZERO_PATTERN.fullmatch(line.strip())
+            if m:
+                layer, pass_no = (int(value) for value in m.groups())
+                self._append_log(
+                    f"[PASS] 剩余列数归零 LAYER={layer} PASS={pass_no}\n")
+                self._stop_x_on_pass_remaining_zero(line.strip(), layer, pass_no)
+                return
             if "PRESS_INK" in line:
                 # 压墨完成/结果回送，仅记录日志
                 self._append_log(f"[压墨] {line}\n")
@@ -995,15 +1150,15 @@ class MainWindow(tk.Tk):
             w.config(state=state)
 
     def _lock_auto_group(self):
-        """自动循环期间锁定 X、Y 及循环参数控件（Z / UV / 滚子不受影响）"""
-        self._set_axis_enabled("X", False)
-        self._set_axis_enabled("Y", False)
+        """自动循环期间锁定 X、Y、Z 三轴及循环参数控件（UV / 滚子不受影响）"""
+        for axis in AXIS_LIMITS:
+            self._set_axis_enabled(axis, False)
         self._set_auto_widgets(False)
-        self.status_var.set("自动循环运行中... X/Y 轴已锁定")
+        self.status_var.set("自动循环运行中... X/Y/Z 轴已锁定")
 
     def _unlock_auto_group(self):
-        self._set_axis_enabled("X", True)
-        self._set_axis_enabled("Y", True)
+        for axis in AXIS_LIMITS:
+            self._set_axis_enabled(axis, True)
         self._set_auto_widgets(True)
 
     def _unlock_all(self):
@@ -1020,10 +1175,7 @@ class MainWindow(tk.Tk):
         if not arrived:
             return
         if self._auto_active:
-            # 自动循环只锁定 X/Y，其他轴（如 Z）到达后正常解锁
-            for a in arrived:
-                if a not in self._pending and a not in ("X", "Y"):
-                    self._set_axis_enabled(a, True)
+            # 自动循环期间 X/Y/Z 三轴全部锁定，到达后不单独解锁
             if not self._pending:
                 self._auto_advance()
                 self._auto_uv_update()
@@ -1032,7 +1184,7 @@ class MainWindow(tk.Tk):
                     self._unlock_auto_group()
                     self.status_var.set(
                         f"已连接 {self.ip_var.get()}:{self.port_var.get()}（自动循环结束）")
-            return  # 自动循环期间 X/Y 保持锁定
+            return  # 自动循环期间三轴保持锁定
         for a in arrived:
             self._set_axis_enabled(a, True)
         if not self._pending:
@@ -1060,6 +1212,80 @@ class MainWindow(tk.Tk):
             if self.press_ink_var.get():
                 t += flashes * self.press_ink_seconds
         return t
+
+    def _update_job_progress(self):
+        """刷新服务器打印任务的当前层/总层数显示。"""
+        self.job_progress_var.set(
+            f"打印进度: {self._job_current_layer}/{self._job_total_layers}")
+
+    def _update_pass_progress(self):
+        """刷新服务器打印任务的当前 PASS/总 PASS 数显示。"""
+        self.pass_progress_var.set(
+            f"PASS进度: {self._pass_current}/{self._pass_total}")
+
+    def _start_job(self, total_layers: int):
+        """服务器 START_JOB 事件：新的任务逻辑，不复用 _start_auto。
+
+        由服务器广播事件（START_JOB / LAYER_START / PASS_READY）驱动。
+        当前仅锁定 X/Y/Z 三轴（循环参数不参与锁定，下方流程不会用到）。
+        """
+        if self._auto_active:
+            self._append_log("[自动] 已在自动循环中，忽略重复 START_JOB\n")
+            return
+        self._flash_count = 0
+        self._x_cycle_count = 0
+        self._cancel_flash_pause()
+        self._auto_active = True
+        self._auto_mode = "server"
+        self._y_start = self.positions["Y"]
+        self._job_current_layer = 0
+        self._job_total_layers = total_layers
+        self._active_layer = 0
+        self._layer_listening = total_layers > 0
+        self._pass_current = 0
+        self._pass_total = 0
+        self._update_job_progress()
+        self._update_pass_progress()
+        self.eta_var.set("")
+        self.cycle_info_var.set("")
+        self._append_log("[自动] 服务器开始任务，进入自动循环\n")
+        # 仅锁定 X/Y/Z 三轴
+        for axis in AXIS_LIMITS:
+            self._set_axis_enabled(axis, False)
+        # 锁定后先记录任务开始时的 Y 位置，再移动 X 到起始位置
+        self._append_log(
+            f"[自动] 记录 Y 初始位置 {fmt_pos(self._y_start)}\n")
+        self._auto_leg = "prehome"
+        self._append_log(f"[自动] 移动 X 到起始位置 {fmt_pos(X_HOME)}\n")
+        self.sender.send_command(f"X={fmt_pos(X_HOME)}")
+        self._wait_target("X", X_HOME)
+        self._auto_uv_update()
+
+    def _complete_server_job(self):
+        """收到服务端 PRINT_JOB_COMPLETED 后清理任务，并清空 Y 初始位置。"""
+        self._auto_active = False
+        self._auto_mode = None
+        self._auto_leg = "complete"
+        self._layer_listening = False
+        self._active_layer = 0
+        self._job_current_layer = 0
+        self._job_total_layers = 0
+        self._pass_current = 0
+        self._pass_total = 0
+        self._outer_remaining = 0
+        self._pending.clear()
+        self._cancel_flash_pause()
+        self._unlock_auto_group()
+        self.cycle_info_var.set("")
+        self.eta_var.set("")
+        self._update_job_progress()
+        self._update_pass_progress()
+        if self.auto_uv_var.get():
+            self._set_uv(False)
+        self._y_start = 0.0
+        self.status_var.set("打印完成，全部流程已结束")
+        self._append_log(
+            "[自动] 打印完成，已结束全部流程并清空 Y 初始位置\n")
 
     def _start_auto(self):
         try:
@@ -1116,6 +1342,7 @@ class MainWindow(tk.Tk):
         self._outer_remaining = outer
         self._y_start = self.positions["Y"]
         self._auto_active = True
+        self._auto_mode = "manual"
         self._auto_eta = self._estimate_auto_time(count, outer, ystep)
         self.eta_var.set(f"预计完成时间: {fmt_duration(self._auto_eta)}")
         self._update_cycle_info()
@@ -1137,6 +1364,7 @@ class MainWindow(tk.Tk):
         if not self._auto_active:
             return
         self._auto_active = False
+        self._auto_mode = None
         self._outer_remaining = 0
         self._pending.clear()
         self._cancel_flash_pause()
@@ -1150,6 +1378,7 @@ class MainWindow(tk.Tk):
     def _auto_abort(self, reason: str):
         """异常终止自动循环（如 Y 步进超出行程）"""
         self._auto_active = False
+        self._auto_mode = None
         self._outer_remaining = 0
         self._pending.clear()
         self._cancel_flash_pause()
@@ -1271,7 +1500,7 @@ class MainWindow(tk.Tk):
 
     def _cancel_flash_pause(self):
         """取消未执行的闪喷定时器并停止警告音（停止/中止/急停/断开时调用）"""
-        for attr in ("_flash_after", "_flash_wait_after"):
+        for attr in ("_flash_after", "_flash_wait_after", "_server_stop_after"):
             timer = getattr(self, attr, None)
             if timer is not None:
                 self.after_cancel(timer)
@@ -1292,15 +1521,272 @@ class MainWindow(tk.Tk):
             f"[自动] X 循环计数达 {X_CYCLE_COUNT_LIMIT}，"
             f"Z 轴下降 {fmt_pos(X_CYCLE_Z_STEP)} -> {fmt_pos(target)}\n")
 
+    def _begin_layer_motion(self):
+        """手动流程收到 LAYER_START 后，从起始位置开始向终点运动。"""
+        if not self._auto_active or self._auto_leg != "wait_layer":
+            return
+        self._begin_x_end_motion()
+
+    def _begin_x_end_motion(self):
+        """按配置文件的 X_END 开始 X 运动。"""
+        target = X_END
+        self._auto_leg = "end"
+        self._append_log(
+            f"[自动] 使用配置文件的 X 终点位置 {fmt_pos(target)}\n")
+        self.sender.send_command(f"X={fmt_pos(target)}")
+        self._wait_target("X", target)
+        # ZERO 可能在 Y 移动或层切换期间提前入队。X 段开始后立即检查，
+        # 但只消费属于当前正式执行层/PASS 的事件。
+        if self._auto_mode == "server":
+            self._stop_x_on_pass_remaining_zero()
+
+    def _try_start_pass(self, received_event=None, current=None, total=None,
+                        step=None, empty=None):
+        """wait_pass_ready 时消费一条合法 PASS_READY，并执行当前 PASS 的 X 运动。"""
+        if not (self._auto_active and self._auto_mode == "server"
+                and self._auto_leg == "wait_pass_ready"):
+            return
+        event = received_event
+        if event is None:
+            # 等待期间服务器可能已经推进了多个 PASS。使用最新事件与服务端
+            # 当前状态对齐，避免回放旧 PASS 后令 ZERO 的 PASS 号永远错位。
+            for _, queued_event in reversed(self.event_queue):
+                match = PASS_READY_PATTERN.fullmatch(queued_event)
+                if match:
+                    current, total, step, empty = (
+                        int(value) for value in match.groups())
+                    event = queued_event
+                    break
+        if (event is None or current is None or total is None
+                or total < 1 or not 1 <= current <= total):
+            return
+        queued_pass_events = [
+            queued_event for _, queued_event in self.event_queue
+            if PASS_READY_PATTERN.fullmatch(queued_event)
+        ]
+        stale_count = max(0, len(queued_pass_events) - 1)
+        # 当前选中的是最新 PASS_READY；同一等待窗口内更早的 PASS_READY 已过期，
+        # 一并移除，不能在后续 X 回起点后再次执行。
+        for queued_event in dict.fromkeys(queued_pass_events):
+            self._remove_event(queued_event)
+        if stale_count:
+            self._append_log(
+                f"[自动] 已跳过 {stale_count} 条过期 PASS_READY，"
+                f"与服务端最新 PASS {current}/{total} 对齐\n")
+        self._pass_current = current
+        self._pass_total = total
+        self._update_pass_progress()
+        self._append_log(
+            f"[自动] 开始 PASS {current}/{total}（STEP={step}, EMPTY={empty}）\n")
+        if empty == 1:
+            self._append_log(
+                f"[自动] PASS {current}/{total} EMPTY=1，跳过 Y/X 运动\n")
+            self._finish_server_pass()
+            return
+        # STEP 单位为 μm；设备 Y 相对移动指令只接受两位小数。
+        # 10 μm = 0.01 mm，使用整数运算实现精确的四舍五入（远离 0）。
+        step_hundredths = (abs(step) + 5) // 10
+        step_mm = step_hundredths / 100.0
+        if step < 0:
+            step_mm = -step_mm
+        if step_mm == 0:
+            self._append_log(
+                f"[自动] PASS STEP={step} μm，四舍五入为 0.00 mm，跳过 Y 移动\n")
+            self._begin_x_end_motion()
+            return
+        y_target = self.positions["Y"] + step_mm
+        if not (AXIS_LIMITS["Y"][0] <= y_target <= AXIS_LIMITS["Y"][1]):
+            self._auto_abort(
+                f"PASS STEP 后 Y 目标 {fmt_pos(y_target)} 超出行程 "
+                f"[{fmt_pos(AXIS_LIMITS['Y'][0])}, {fmt_pos(AXIS_LIMITS['Y'][1])}]")
+            return
+        sign = "+" if step_mm > 0 else "-"
+        distance = f"{abs(step_mm):.2f}"
+        self._auto_leg = "pass_ystep"
+        self._append_log(
+            f"[自动] PASS STEP={step} μm，四舍五入后 Y 相对移动 {sign}{distance} mm "
+            f"-> {fmt_pos(y_target)}\n")
+        self.sender.send_command(f"Y{sign}{distance}")
+        self._wait_target("Y", y_target)
+        self._auto_uv_update()
+
+    def _finish_server_pass(self):
+        """当前服务器 PASS 完成后，先让 X 回起点；到位后再判断是否还有 PASS。"""
+        if not (self._auto_active and self._auto_mode == "server"):
+            return
+        self._auto_leg = "pass_return_home"
+        self.status_var.set(
+            f"PASS {self._pass_current}/{self._pass_total} 完成，X 返回起始位置")
+        self._append_log(
+            f"[自动] PASS {self._pass_current}/{self._pass_total} 完成，"
+            f"X 返回起始位置 {fmt_pos(X_HOME)}，到位后判断 CURRENT < TOTAL\n")
+        self.sender.send_command(f"X={fmt_pos(X_HOME)}")
+        self._wait_target("X", X_HOME)
+        self._auto_uv_update()
+
+    def _stop_x_on_pass_remaining_zero(self, event=None, layer=None, pass_no=None):
+        """只用当前执行层/PASS 的 ZERO 事件急停 X；早到事件保留在队列。"""
+        if not (self._auto_active
+                and self._auto_mode == "server"
+                and self._auto_leg == "end"
+                and "X" in self._pending):
+            return False
+        if event is None:
+            for _, queued_event in self.event_queue:
+                match = PASS_REMAINING_ZERO_PATTERN.fullmatch(queued_event)
+                if not match:
+                    continue
+                queued_layer, queued_pass = (
+                    int(value) for value in match.groups())
+                if (queued_layer == self._active_layer
+                        and queued_pass == self._pass_current):
+                    event = queued_event
+                    layer = queued_layer
+                    pass_no = queued_pass
+                    break
+        if (event is None or layer != self._active_layer
+                or pass_no != self._pass_current):
+            return False
+        self._remove_event(event)
+        self._pending.pop("X", None)
+        self._auto_leg = "wait_after_pass_stop"
+        self.sender.send_urgent(CMD_ESTOP)
+        self._auto_uv_update()
+        wait_text = fmt_pos(PASS_STOP_WAIT_SECONDS)
+        self.status_var.set(
+            f"LAYER={layer} PASS={pass_no} 剩余列数为 0，"
+            f"X 已急停，等待 {wait_text} 秒")
+        self._append_log(
+            f"[自动] LAYER={layer} PASS={pass_no} 剩余列数变为 0，"
+            f"已发送 q 停止 X，等待 {wait_text} 秒\n")
+        self._server_stop_after = self.after(
+            PASS_STOP_WAIT_MS, self._resume_after_pass_stop)
+        return True
+
+    def _resume_after_pass_stop(self):
+        """每次 PASS 急停后等待配置时长，再完成当前 PASS。"""
+        self._server_stop_after = None
+        if not (self._auto_active and self._auto_mode == "server"
+                and self._auto_leg == "wait_after_pass_stop"):
+            return
+        self._append_log(
+            f"[自动] 急停后等待 {fmt_pos(PASS_STOP_WAIT_SECONDS)} 秒完成，"
+            "继续 PASS 流程\n")
+        self._finish_server_pass()
+
+    def _try_start_layer(self, received_layer=None):
+        """wait_layer 时，消费任意合法的 LAYER_START，并开始该层流程。
+
+        若广播早于起始位置就位则从队列查找并消费；若广播尚未到达则保持
+        wait_layer，待 LAYER_START 处理器入队后传入对应层号再次触发。
+        """
+        if not (self._auto_active and self._auto_leg == "wait_layer"):
+            return
+        max_layer = self._job_total_layers if self._auto_mode == "server" else 1
+        layer = received_layer
+        event = None
+        if layer is not None:
+            candidate = f"EVENT LAYER_START LAYER={layer}"
+            if any(ev == candidate for _, ev in self.event_queue):
+                event = candidate
+        else:
+            for _, queued_event in self.event_queue:
+                match = LAYER_START_PATTERN.fullmatch(queued_event)
+                if match:
+                    candidate_layer = int(match.group(1))
+                    if 1 <= candidate_layer <= max_layer:
+                        layer = candidate_layer
+                        event = queued_event
+                        break
+        if (event is None or layer is None
+                or not 1 <= layer <= max_layer):
+            return
+        self._remove_event(event)
+        if self._auto_mode == "server":
+            self._active_layer = layer
+            if self._job_current_layer != layer:
+                self._job_current_layer = layer
+                self._update_job_progress()
+            if layer == self._job_total_layers:
+                self._layer_listening = False
+        self._append_log(
+            f"[自动] 收到 LAYER_START LAYER={layer}\n")
+        if self._auto_mode == "server":
+            if self._auto_leg == "wait_layer":
+                self._pass_current = 0
+                self._pass_total = 0
+                self._update_pass_progress()
+                if not (AXIS_LIMITS["Y"][0] <= self._y_start <= AXIS_LIMITS["Y"][1]):
+                    self._auto_abort(
+                        f"Y 初始位置 {fmt_pos(self._y_start)} 超出行程")
+                    return
+                self._auto_leg = "layer_yhome"
+                self._append_log(
+                    f"[自动] 新层开始，Y 移动到初始位置 {fmt_pos(self._y_start)}\n")
+                self.sender.send_command(f"Y={fmt_pos(self._y_start)}")
+                self._wait_target("Y", self._y_start)
+                self._auto_uv_update()
+        else:
+            self._begin_layer_motion()
+
     def _auto_advance(self) -> bool:
         """一段到达后推进自动循环，返回 True 表示已发出下一段"""
         if self._auto_leg == "prehome":
-            # 已回到起始位置 -> 开始第一次向终点运动
-            self._auto_leg = "end"
-            self.sender.send_command(f"X={fmt_pos(X_END)}")
-            self._wait_target("X", X_END)
+            # 手动流程在 prehome 到位后记录 Y；服务器流程已在移动 X 前记录，不能在此覆盖。
+            if self._auto_mode == "manual":
+                self._y_start = self.positions["Y"]
+                self._append_log(
+                    f"[自动] 记录 Y 初始位置 {fmt_pos(self._y_start)}\n")
+            self._auto_leg = "wait_layer"
+            # 从队列消费任意合法的 LAYER_START；存在则先让 Y 回任务初始位置。
+            self._try_start_layer()
+            return True
+        if self._auto_leg == "wait_layer":
+            # 等待 LAYER_START 事件触发层处理
+            return True
+        if self._auto_leg == "wait_pass_ready":
+            # 等待 PASS_READY 事件触发当前 PASS 的 X 运动
+            return True
+        if self._auto_leg == "layer_yhome":
+            # 每层开始时 Y 回到任务初始位置，到位后再进入 PASS 循环。
+            self._auto_leg = "wait_pass_ready"
+            self.status_var.set("Y 已回到初始位置，等待 PASS_READY")
+            self._append_log("[自动] Y 已回到初始位置，等待 PASS_READY\n")
+            self._try_start_pass()
+            return True
+        if self._auto_leg == "pass_ystep":
+            # 当前 PASS 的 Y 相对移动到位后，再执行动态 X 终点流程。
+            self._begin_x_end_motion()
+            return True
+        if self._auto_leg == "pass_return_home":
+            # 每个 PASS 都先回 X_HOME；到位后才判断是否进入下一 PASS。
+            if self._pass_total > 0 and self._pass_current < self._pass_total:
+                self._auto_leg = "wait_pass_ready"
+                self.status_var.set("X 已回到起始位置，等待下一条 PASS_READY")
+                self._append_log(
+                    "[自动] X 已回到起始位置，CURRENT < TOTAL，"
+                    "等待下一条 PASS_READY\n")
+                self._try_start_pass()
+                return True
+            self._pass_current = 0
+            self._pass_total = 0
+            self._update_pass_progress()
+            self._auto_leg = "wait_layer"
+            self.status_var.set("X 已回到起始位置，本层完成，等待下一层 LAYER_START")
+            self._append_log(
+                "[自动] X 已回到起始位置，CURRENT < TOTAL 为否，"
+                "等待下一层 LAYER_START\n")
+            self._try_start_layer()
             return True
         if self._auto_leg == "end":
+            if self._auto_mode == "server":
+                # 正常流程一定会在移动中收到 PASS_REMAINING_ZERO 并急停，不会抵达 X_END。
+                # 此处仅作协议异常保护，防止意外落入手动任务的计数/闪喷/回程逻辑。
+                self._auto_leg = "unexpected_end"
+                self._append_log(
+                    f"[自动] 未收到 PASS_REMAINING_ZERO 即到达终点 {fmt_pos(X_END)}，"
+                    "已停止流程推进\n")
+                return True
             # 到达终点 -> 计数；启用维护闪喷且达间隔时，先暂停闪喷再返回起始
             self._flash_count += 1
             # X 到达终点累计计数达阈值时，Z 轴下降（独立于闪喷计数）
@@ -1373,6 +1859,7 @@ class MainWindow(tk.Tk):
             return True
         # 全部完成
         self._auto_active = False
+        self._auto_mode = None
         self._outer_remaining = 0
         self.cycle_info_var.set("")
         self.eta_var.set("")
@@ -1441,6 +1928,7 @@ class MainWindow(tk.Tk):
         """急停：立即发送 q，打断所有运动，终止自动循环并全部解锁"""
         self.sender.send_urgent(CMD_ESTOP)
         self._auto_active = False
+        self._auto_mode = None
         self._outer_remaining = 0
         self._pending.clear()
         self._cancel_flash_pause()
@@ -1474,7 +1962,6 @@ class MainWindow(tk.Tk):
             self.roller_btn.config(text=f"滚子: {'运行' if roller else '停止'}")
             self.last_report_var.set(
                 f"最后上报: {time.strftime('%H:%M:%S')}  {frame}")
-            self._append_log(f"[上报] {frame}\n")
             self._check_arrival()
             self._auto_uv_position_check(x)
         self.after(0, update)
@@ -1488,6 +1975,7 @@ class MainWindow(tk.Tk):
                 # 断开后清空等待目标并解锁，避免卡死
                 self._pending.clear()
                 self._auto_active = False
+                self._auto_mode = None
                 self._outer_remaining = 0
                 self._cancel_flash_pause()
                 self.cycle_info_var.set("")

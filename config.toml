@@ -23,6 +23,8 @@ x_end = 80.0
 # x_end = 220.0
 y_step = 1.73 # Y 步进输入框的默认距离 (mm)
 y_step_dir = "+" # 自动循环中 Y 轴步进方向，"-" 负向(减小) / "+" 正向(增大)
+# 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
+pass_stop_wait_seconds = 1.0
 
 # 点动步长选项 (mm)，UI 中显示为单选按钮，默认选中第一个
 [jog]
@@ -62,4 +64,3 @@ z = 1.0
 scale = 1.6
 window_size = [660, 520]
 column_widths = [300, 440]
-
