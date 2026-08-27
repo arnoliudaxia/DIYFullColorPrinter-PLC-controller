@@ -1008,22 +1008,8 @@ class MainWindow(tk.Tk):
                 layer, pass_no = (int(value) for value in m.groups())
                 self._append_log(
                     f"[PASS] 剩余列数归零 LAYER={layer} PASS={pass_no}\n")
-                handled = self._stop_x_on_pass_remaining_zero(line.strip(), layer, pass_no)
-                if (not handled and self.auto_uv_var.get()
-                        and self._auto_active and self._auto_mode == "server"
-                        and self._auto_leg == "wait_pass_zero"):
-                    # 自动 UV 模式下 X 已到位，ZERO 晚到时直接衔接
-                    # 原急停后的计数、维护闪喷和等待逻辑。
-                    self._auto_leg = "end"
-                    self._auto_advance()
-                elif (not handled and self._auto_active
-                      and self._auto_mode == "server"
-                      and self._auto_leg == "wait_pass_zero"):
-                    # 事件可能因层号状态更新时序尚未同步；既然当前正等待
-                    # ZERO，直接消费该事件并继续，不让流程永久等待。
-                    self._remove_event(line.strip())
-                    self._auto_leg = "end"
-                    self._auto_advance()
+                # ZERO 事件仅作日志记录；PASS 完成以 X 到达终点为准。
+                self._remove_event(line.strip())
                 return
             if "PRESS_INK" in line:
                 # 压墨完成/结果回送，仅记录日志
@@ -1216,6 +1202,7 @@ class MainWindow(tk.Tk):
         self._auto_active = False
         self._auto_mode = None
         self._auto_leg = "complete"
+        self._auto_leg = "complete"
         self._layer_listening = False
         self._active_layer = 0
         self._job_current_layer = 0
@@ -1224,7 +1211,13 @@ class MainWindow(tk.Tk):
         self._pass_total = 0
         self._outer_remaining = 0
         self._pending.clear()
+        self.event_queue.clear()
+        self.event_list.delete(0, "end")
+        self.event_count_var.set("0 条")
         self._cancel_flash_pause()
+        self.event_queue.clear()
+        self.event_list.delete(0, "end")
+        self.event_count_var.set("0 条")
         self._unlock_auto_group()
         self.cycle_info_var.set("")
         self.eta_var.set("")
@@ -1233,6 +1226,12 @@ class MainWindow(tk.Tk):
         if self.auto_uv_var.get():
             self._set_uv(False)
         self._y_start = 0.0
+        self._auto_ystep = 10.0
+        self._inner_total = 0
+        self._auto_remaining = 0
+        self._flash_count = 0
+        self._update_auto_counts()
+        self._auto_eta = 0.0
         self._play_finish_sound()
         self.status_var.set("打印完成，全部流程已结束")
         self._append_log(
@@ -1307,26 +1306,39 @@ class MainWindow(tk.Tk):
             return
         self._auto_active = False
         self._auto_mode = None
+        self._auto_leg = "stopped"
         self._outer_remaining = 0
         self._pending.clear()
         self._cancel_flash_pause()
+        self.event_queue.clear()
+        self.event_list.delete(0, "end")
+        self.event_count_var.set("0 条")
         self._unlock_auto_group()
         self.cycle_info_var.set("")
         self.eta_var.set("")
-        if self.auto_uv_var.get():
-            self._set_uv(False)
+        self._pass_current = self._pass_total = 0
+        self._update_pass_progress()
+        self._set_uv(False)
+        self._set_uv(False)
         self._append_log("[自动] 已停止（当前这段运动会继续走完）\n")
 
     def _auto_abort(self, reason: str):
         """异常终止自动循环（如 Y 步进超出行程）"""
         self._auto_active = False
         self._auto_mode = None
+        self._auto_leg = "aborted"
         self._outer_remaining = 0
         self._pending.clear()
         self._cancel_flash_pause()
+        self.event_queue.clear()
+        self.event_list.delete(0, "end")
+        self.event_count_var.set("0 条")
         self._unlock_auto_group()
         self.cycle_info_var.set("")
         self.eta_var.set("")
+        self._pass_current = self._pass_total = 0
+        self._update_pass_progress()
+        self._set_uv(False)
         if self.auto_uv_var.get():
             self._set_uv(False)
         self._append_log(f"[自动] 已中止: {reason}\n")
@@ -1471,10 +1483,7 @@ class MainWindow(tk.Tk):
             f"[自动] 使用配置文件的 X 终点位置 {fmt_pos(target)}\n")
         self.sender.send_command(f"X={fmt_pos(target)}")
         self._wait_target("X", target)
-        # ZERO 可能在 Y 移动或层切换期间提前入队。X 段开始后立即检查，
-        # 但只消费属于当前正式执行层/PASS 的事件。
-        if self._auto_mode == "server":
-            self._stop_x_on_pass_remaining_zero()
+        # 服务器模式不再依赖 PASS_REMAINING_ZERO，X 到位即完成 PASS。
 
     def _try_start_pass(self, received_event=None, current=None, total=None,
                         step=None, empty=None):
@@ -1625,16 +1634,16 @@ class MainWindow(tk.Tk):
                 return
 
     def _start_server_stop_wait(self):
-        """进入服务端 PASS 急停后的配置等待。"""
+        """进入服务端 PASS 到位后的配置等待。"""
         if not (self._auto_active and self._auto_mode == "server"):
             return
         self._auto_leg = "wait_after_pass_stop"
         wait_text = fmt_pos(PASS_STOP_WAIT_SECONDS)
         self.status_var.set(
-            f"LAYER={self._active_layer} PASS={self._pass_current} 已急停，"
+            f"LAYER={self._active_layer} PASS={self._pass_current} 已到达终点，"
             f"等待 {wait_text} 秒")
         self._append_log(
-            f"[自动] 急停后等待 {wait_text} 秒\n")
+            f"[自动] PASS 终点后等待 {wait_text} 秒\n")
         self._server_stop_after = self.after(
             PASS_STOP_WAIT_MS, self._resume_after_pass_stop)
 
@@ -1645,7 +1654,7 @@ class MainWindow(tk.Tk):
                 and self._auto_leg == "wait_after_pass_stop"):
             return
         self._append_log(
-            f"[自动] 急停后等待 {fmt_pos(PASS_STOP_WAIT_SECONDS)} 秒完成，"
+            f"[自动] PASS 终点后等待 {fmt_pos(PASS_STOP_WAIT_SECONDS)} 秒完成，"
             "继续 PASS 流程\n")
         self._finish_server_pass()
 
@@ -1754,28 +1763,18 @@ class MainWindow(tk.Tk):
             return True
         if self._auto_leg == "end":
             if self._auto_mode == "server":
-                if self.auto_uv_var.get():
-                    # 自动 UV 模式下不急停，完整移动至带 UV 终点后关闭 UV，
-                    # 再执行原急停后的计数、维护闪喷及等待逻辑。
-                    self._set_uv(False)
-                    self._remove_matching_pass_zero()
-                    self._flash_count += 1
+                # 服务器模式以 X 到达配置终点即视为 PASS 完成，不再等待或急停。
+                self._set_uv(False)
+                self._flash_count += 1
+                self._update_auto_counts()
+                if (self.flash_maintain_var.get()
+                        and self._flash_count >= self._flash_interval):
+                    self._flash_count = 0
                     self._update_auto_counts()
-                    if (self.flash_maintain_var.get()
-                            and self._flash_count >= self._flash_interval):
-                        self._flash_count = 0
-                        self._update_auto_counts()
-                        self._auto_leg = "server_flash_pause"
-                        self._flash_pause()
-                    else:
-                        self._start_server_stop_wait()
-                    return True
-                # X 先到终点时，ZERO 事件可能尚未到达；进入等待状态，
-                # 由稍后收到的 PASS_REMAINING_ZERO 继续执行后续逻辑。
-                self._auto_leg = "wait_pass_zero"
-                self._append_log(
-                    f"[自动] X 已到达终点 {fmt_pos(X_END)}，等待 PASS_REMAINING_ZERO 事件\n")
-                self._stop_x_on_pass_remaining_zero()
+                    self._auto_leg = "server_flash_pause"
+                    self._flash_pause()
+                else:
+                    self._start_server_stop_wait()
                 return True
             # 到达终点 -> 计数；启用维护闪喷且达间隔时，先暂停闪喷再返回起始
             self._flash_count += 1

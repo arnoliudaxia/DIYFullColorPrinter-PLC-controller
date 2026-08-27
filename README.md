@@ -86,13 +86,12 @@ flowchart TD
     UVEND --> UVON{X ≥ uv_offset?}
     UVON -- 是 --> LAMPON[开启 UV 灯]
     UVON -- 否 --> UVON
-    END --> ZERO[收到或队列中已有<br/>与当前 LAYER/PASS 匹配的<br/>PASS_REMAINING_ZERO]
+    END --> ZERO[X 到达 x_end 即视为 PASS 完成<br/>不等待 PASS_REMAINING_ZERO]
     LAMPON --> UVARRIVE[等待 X 到达 x_end_withuv]
     UVARRIVE --> LAMPOFF[关闭 UV 灯]
-    LAMPOFF --> ZERO_UV[等待/消费 PASS_REMAINING_ZERO<br/>不发送急停]
+    LAMPOFF --> ZERO_UV[关闭 UV 后视为 PASS 完成<br/>不发送急停]
     ZERO_UV --> COUNT
-    ZERO --> ESTOP[每次发送急停指令 q<br/>停止 X 运动]
-    ESTOP --> COUNT[闪喷计数 +1<br/>界面显示计数]
+    ZERO --> COUNT[闪喷计数 +1<br/>界面显示计数]
     COUNT --> FLASH_DUE{启用维护闪喷 且<br/>闪喷计数 ≥ flash.interval?}
     FLASH_DUE -- 是 --> FLASH_RESET[执行维护闪喷<br/>闪喷计数清零]
     FLASH_RESET --> XOFFSET[X 正向偏移 flash.x_offset]
@@ -110,7 +109,6 @@ flowchart TD
     classDef emergency fill:#fee2e2,stroke:#dc2626,stroke-width:3px,color:#7f1d1d,font-weight:bold
     classDef zStep fill:#dcfce7,stroke:#16a34a,stroke-width:3px,color:#14532d,font-weight:bold
     class PY yInitial
-    class ESTOP emergency
     class ZCOUNT,ZSTEP,ZWAIT zStep
     class FLASH_DUE,FLASH_RESET,XOFFSET,XOFFSET_WAIT zStep
     class PREHOME emergency
@@ -136,9 +134,9 @@ flowchart TD
 | `layer_yhome` | 每层开始时 Y 绝对移动到任务开始时记录的 Y 初始位置并等待到位 | → `wait_pass_ready` |
 | `wait_pass_ready` | 循环等待并消费最新的合法 `EVENT PASS_READY`，清除同一等待窗口内更早的过期事件，显示 `CURRENT/TOTAL` | `EMPTY=1` → 当前 PASS 完成；`EMPTY=0` → `pass_ystep` |
 | `pass_ystep` | 将 `STEP` 从 μm 转成 mm，四舍五入到两位小数，按正负号执行 Y 相对移动并等待到位 | → `end`（执行当前 PASS 的 X 终点运动） |
-| `server_flash_pause` | 急停计数后，若已启用维护闪喷且闪喷计数达到 `[flash].interval`，则将闪喷计数清零并执行维护闪喷 | 闪喷结束 → `wait_after_pass_stop` |
-| `wait_after_pass_stop` | 匹配当前执行层/PASS 的 `PASS_REMAINING_ZERO` 触发 `q` 急停，闪喷计数与 X 循环计数各加 1 并刷新界面；达到闪喷间隔时先完成维护闪喷，随后按配置时长等待；不匹配的事件留在队列 | → `pass_return_home` |
-| `end` | X 向终点运动 | 手动任务：计数 → 维护闪喷（可选）或 → `home`；服务器任务收到匹配 ZERO 并按配置等待后 → `pass_return_home` |
+| `server_flash_pause` | PASS 到达终点后，若已启用维护闪喷且闪喷计数达到 `[flash].interval`，则将闪喷计数清零并执行维护闪喷 | 闪喷结束 → `wait_after_pass_stop` |
+| `wait_after_pass_stop` | PASS 到达 X 终点后的配置等待；达到闪喷间隔时先完成维护闪喷，随后按配置时长等待 | → `pass_return_home` |
+| `end` | X 向终点运动；到达即视为服务器 PASS 完成，不等待 ZERO 或急停 | → `wait_after_pass_stop` |
 | `pass_return_home` | 每个服务器 PASS 完成后移动 X 到 `X_HOME` 并等待到位 | 到位后判断 `CURRENT < TOTAL`：是 → `wait_pass_ready`；否 → `wait_layer` |
 | `home` | X 回起点，完成一次内循环 | 内循环剩余>0 → `ystep`；否则 → 结束本组 |
 | `ystep` | 内循环间 Y 按方向步进 | → `end`（下一次内循环） |
@@ -151,20 +149,20 @@ flowchart TD
 | `[auto_cycle] x_home / x_end` | X 轴往返端点 |
 | `[auto_cycle] x_end_withuv` | 自动 UV 开启时 PASS 使用的 X 终点 |
 | `[auto_cycle] uv_offset` | 自动 UV 开启阈值；X 达到该位置时开灯，默认 `120 mm` |
-| `[auto_cycle] pass_stop_wait_seconds` | `PASS_REMAINING_ZERO` 急停后的等待时间（秒） |
+| `[auto_cycle] pass_stop_wait_seconds` | PASS 到达 X 终点后的等待时间（秒） |
 | `[z_step] layers / step` | 打印层数每达到 `layers` 的倍数下降 `step` mm |
 | `[flash] interval` | 维护闪喷间隔，即累计多少次 X 循环/急停后执行一次维护闪喷；仅通过配置文件设置，UI 不提供输入框；必须为正整数，默认 `10` |
 | `[flash] pause_ms` | 维护闪喷暂停时长 (ms) |
 | `[flash] x_offset` | 开启维护闪喷前 X 轴正向偏移量 (mm)，默认 `0` |
 
-### 维护闪喷（急停计数达到间隔时）
+### 维护闪喷（PASS 终点计数达到间隔时）
 
 达到配置的闪喷间隔后，先按 `[flash].x_offset` 让 X 轴正向偏移并等待到位，再发送 `FLASH` 开启闪喷；等待 `pause_ms` 后若闪喷仍开启则再次发送 `FLASH` 关闭并等待回送确认（带超时保护），确认关闭后继续流程。服务器驱动流程不执行自动压墨。
 
 ### 自动 UV 灯（可选）
 
-- 自动 UV 关闭时，PASS 使用 `x_end`，收到 `PASS_REMAINING_ZERO` 后发送 `q` 急停。
-- 自动 UV 开启时，PASS 使用 `x_end_withuv`；X ≥ `[auto_cycle] uv_offset` 时开灯，X 到达终点后关灯，再等待并消费 `PASS_REMAINING_ZERO`，不发送急停。其余运动段一律关灯。
+- 自动 UV 关闭时，PASS 使用 `x_end`，X 到达终点即完成，不发送 `q` 急停。
+- 自动 UV 开启时，PASS 使用 `x_end_withuv`；X ≥ `[auto_cycle] uv_offset` 时开灯，X 到达终点后关灯并完成 PASS，不等待 `PASS_REMAINING_ZERO`。其余运动段一律关灯。
 - 停止/中止/急停/断开时自动关灯。
 
 ## 其他功能
