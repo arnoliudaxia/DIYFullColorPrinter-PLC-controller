@@ -19,10 +19,10 @@ max = 125.0
 # 同时用于 X 轴预设中的"起始位置"/"终点位置"按钮
 [auto_cycle]
 x_home = 0.0
-x_end = 80.0
-# x_end = 220.0
-y_step = 1.73 # Y 步进输入框的默认距离 (mm)
-y_step_dir = "+" # 自动循环中 Y 轴步进方向，"-" 负向(减小) / "+" 正向(增大)
+x_end = 200.0
+x_end_withuv = 220.0
+# 自动 UV 灯开启的 X 轴水平偏移 (mm)
+uv_offset = 120.0
 # 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
 pass_stop_wait_seconds = 1.0
 
@@ -38,9 +38,11 @@ step = 0.5
 
 # 闪喷：interval 为累计多少次 X 循环/急停后执行一次维护闪喷（仅在此处设置）
 # pause_ms 为维护闪喷时在终点暂停的时长 (ms)
+# x_offset 为开启维护闪喷前 X 轴正向偏移量 (mm)
 [flash]
 interval = 10
 pause_ms = 2000
+x_offset=20
 
 # 压墨：勾选"自动压墨"时，自动循环闪喷前执行：
 #   Z 下降 z_drop → 发送 PRESS_INK <所选时长> 秒 → 循环播放 warning.mp3 并弹窗"请手动刮墨"
@@ -52,12 +54,6 @@ pause_ms = 2000
 z_drop = 80.0
 durations = [2, 5, 10]
 press_z = 70.0
-
-# 各轴移动速度 (mm/s)，用于预计完成时间
-[speeds]
-x = 30.0
-y = 10.0
-z = 1.0
 
 # UI：整体缩放系数、窗口宽高（按缩放系数放大）
 # 两列布局：左侧连接/服务/设备/日志，右侧轴控制，窗口加宽减高

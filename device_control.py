@@ -14,7 +14,6 @@
   连接成功后服务器发送: NETSCAN_SERVER_READY
   闪喷命令 FLASH，回复单行: OK FLASH BEFORE=OFF AFTER=ON（回送修改前/后的闪喷状态）
   压墨命令 PRESS_INK <秒数>，完成回送: OK PRESS_INK SECONDS=.. RESULT=COMPLETED STATE=OFF
-  自动压墨：勾选后在自动循环闪喷前执行 压墨Z下降→PRESS_INK→循环播放warning.mp3并弹窗
     请手动刮墨→点击确定后 Z 回升→继续闪喷（Z 下降量/压墨时长在 config.toml 配置）
 """
 
@@ -66,6 +65,8 @@ _DEFAULT_AXIS_LIMITS = {
 }
 _DEFAULT_X_HOME = 0.0
 _DEFAULT_X_END = 220.0
+_DEFAULT_X_END_WITH_UV = 220.0
+_DEFAULT_UV_OFFSET = 120.0
 
 
 def _load_config() -> dict:
@@ -89,40 +90,22 @@ def _load_axis_limits(cfg: dict) -> dict:
 
 
 def _load_cycle_endpoints(cfg: dict):
-    home, end = _DEFAULT_X_HOME, _DEFAULT_X_END
+    home, end, end_with_uv = _DEFAULT_X_HOME, _DEFAULT_X_END, _DEFAULT_X_END_WITH_UV
     try:
         home = float(cfg["auto_cycle"]["x_home"])
         end = float(cfg["auto_cycle"]["x_end"])
+        end_with_uv = float(cfg["auto_cycle"].get("x_end_withuv", end_with_uv))
     except (KeyError, TypeError, ValueError):
         pass
-    return home, end
+    return home, end, end_with_uv
 
 
-_DEFAULT_Y_STEP = 10.0  # Y 步进输入框的默认距离 (mm)
-
-
-def _load_y_step_default(cfg: dict) -> float:
-    """自动循环 Y 步进距离默认值，来自 config.toml y_step"""
+def _load_uv_offset(cfg: dict) -> float:
     try:
-        val = float(cfg["auto_cycle"]["y_step"])
-        if val < 0:
-            raise ValueError
-        return val
+        value = float(cfg["auto_cycle"].get("uv_offset", _DEFAULT_UV_OFFSET))
+        return value if value >= 0 else _DEFAULT_UV_OFFSET
     except (KeyError, TypeError, ValueError):
-        return _DEFAULT_Y_STEP
-
-
-def _load_y_step_dir(cfg: dict) -> int:
-    """自动循环 Y 轴步进方向：-1 负向 / +1 正向，来自 config.toml y_step_dir"""
-    try:
-        val = str(cfg["auto_cycle"]["y_step_dir"]).strip()
-        if val in ("+", "1", "正"):
-            return 1
-        if val in ("-", "-1", "负"):
-            return -1
-    except (KeyError, TypeError, ValueError):
-        pass
-    return -1
+        return _DEFAULT_UV_OFFSET
 
 
 _DEFAULT_PASS_STOP_WAIT_SECONDS = 2.0
@@ -176,6 +159,7 @@ def _load_z_step(cfg: dict):
 
 
 _DEFAULT_FLASH_PAUSE_MS = 2000
+_DEFAULT_FLASH_X_OFFSET = 0.0
 
 
 def _load_flash_interval(cfg: dict) -> int:
@@ -204,20 +188,29 @@ def _load_flash_pause(cfg: dict) -> int:
     return ms
 
 
-_DEFAULT_PRESS_INK = (80.0, 70.0)      # (刮墨时 Z 下降/回升量, 压墨高度预设)
+def _load_flash_x_offset(cfg: dict) -> float:
+    """维护闪喷前 X 轴正向偏移量（mm）。"""
+    offset = _DEFAULT_FLASH_X_OFFSET
+    try:
+        offset = float(cfg["flash"]["x_offset"])
+        if offset < 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        offset = _DEFAULT_FLASH_X_OFFSET
+    return offset
+
+
+_DEFAULT_PRESS_Z_PRESET = 70.0
 _DEFAULT_PRESS_INK_DURATIONS = (2.0, 5.0, 10.0)  # 压墨时长可选值 (s)
 
 
 def _load_press_ink(cfg: dict):
-    z_drop, press_z = _DEFAULT_PRESS_INK
+    press_z = _DEFAULT_PRESS_Z_PRESET
     try:
-        z_drop = float(cfg["press_ink"]["z_drop"])
         press_z = float(cfg["press_ink"]["press_z"])
-        if z_drop <= 0:
-            raise ValueError
     except (KeyError, TypeError, ValueError):
         pass
-    return z_drop, press_z
+    return press_z
 
 
 def _load_press_ink_durations(cfg: dict) -> tuple:
@@ -230,22 +223,6 @@ def _load_press_ink_durations(cfg: dict) -> tuple:
     except (KeyError, TypeError, ValueError):
         pass
     return durations
-
-
-_DEFAULT_SPEEDS = (20.0, 10.0, 1.0)
-
-
-def _load_speeds(cfg: dict):
-    vx, vy, vz = _DEFAULT_SPEEDS
-    try:
-        vx = float(cfg["speeds"]["x"])
-        vy = float(cfg["speeds"]["y"])
-        vz = float(cfg["speeds"]["z"])
-        if min(vx, vy, vz) <= 0:
-            raise ValueError
-    except (KeyError, TypeError, ValueError):
-        pass
-    return vx, vy, vz
 
 
 _DEFAULT_UI_SCALE = 1.6
@@ -271,24 +248,23 @@ def _load_ui(cfg: dict):
 
 _CONFIG = _load_config()
 AXIS_LIMITS = _load_axis_limits(_CONFIG)
-X_HOME, X_END = _load_cycle_endpoints(_CONFIG)
-Y_STEP_DEFAULT = _load_y_step_default(_CONFIG)  # Y 步进默认距离 (mm)
-Y_STEP_DIR = _load_y_step_dir(_CONFIG)  # 自动循环 Y 轴步进方向 (-1 负 / +1 正)
+X_HOME, X_END, X_END_WITH_UV = _load_cycle_endpoints(_CONFIG)
+UV_OFFSET_DEFAULT = _load_uv_offset(_CONFIG)
 PASS_STOP_WAIT_SECONDS = _load_pass_stop_wait_seconds(_CONFIG)
 PASS_STOP_WAIT_MS = int(round(PASS_STOP_WAIT_SECONDS * 1000))
 JOG_STEPS = _load_jog_steps(_CONFIG)
 X_CYCLE_COUNT_LIMIT, X_CYCLE_Z_STEP = _load_z_step(_CONFIG)
 FLASH_INTERVAL_DEFAULT = _load_flash_interval(_CONFIG)
 FLASH_PAUSE_MS = _load_flash_pause(_CONFIG)
-PRESS_INK_Z_DROP, PRESS_INK_Z_PRESET = _load_press_ink(_CONFIG)
+FLASH_X_OFFSET = _load_flash_x_offset(_CONFIG)
+PRESS_INK_Z_PRESET = _load_press_ink(_CONFIG)
 PRESS_INK_DURATIONS = _load_press_ink_durations(_CONFIG)
-VX_MMS, VY_MMS, VZ_MMS = _load_speeds(_CONFIG)
 UI_SCALE, WIN_SIZE, COL_WIDTHS = _load_ui(_CONFIG)
 
 # 点动按钮文字: {轴: (负方向, 正方向)}，保留正负号
 JOG_LABELS = {
     "X": ("-右", "+左"),
-    "Y": ("-PASS", "+前"),
+    "Y": ("-人后", "+人前"),
     "Z": ("-下", "+上"),
 }
 
@@ -554,7 +530,8 @@ class MainWindow(tk.Tk):
         self._pass_total = 0
         self._auto_leg = "end"     # 当前段: "end"/"home"/"ystep"/"yback"
         self._auto_ystep = 10.0    # 循环间 Y 轴负向步进量
-        self._uv_dist = 120.0      # UV 灯开灯的 X 位置（水平距离）
+        self._uv_dist = UV_OFFSET_DEFAULT      # UV 灯开灯的 X 位置（水平偏移）
+        self._server_zero_received = False
         # 打印中维护闪喷：X 到达终点累计计数（不管 Y step / 大循环，一直累加）
         self._flash_count = 0      # X 到达终点累计次数
         self._flash_interval = FLASH_INTERVAL_DEFAULT
@@ -563,11 +540,10 @@ class MainWindow(tk.Tk):
         self._flash_wait_off = False  # 是否正在等待结束闪喷回送
         self._flash_wait_after = None # 结束闪喷回送超时定时器 id
         self._server_stop_after = None  # 每次 PASS_REMAINING_ZERO 急停后的 2s 等待
-        self._x_cycle_count = 0       # X 到达终点累计计数（达阈值清零）
         self._auto_eta = 0.0          # 本次自动循环预计完成时间 (s)
         self.eta_var = tk.StringVar(value="")  # 预计完成时间显示
         self.auto_count_var = tk.StringVar(
-            value="闪喷计数: 0    X循环计数: 0")
+            value="闪喷计数: 0")
 
         self.sender = TcpSender(
             on_sent=self._on_sent,
@@ -756,8 +732,8 @@ class MainWindow(tk.Tk):
         self.pass_progress_var = tk.StringVar(value="PASS进度: 0/0")
         ttk.Label(head, textvariable=self.pass_progress_var,
                   foreground="#7b1fa2").pack(side="left", padx=(12, 0))
-        ttk.Button(head, text="清空", width=6,
-                   command=self._clear_event_queue).pack(side="right")
+        ttk.Button(head, text="停止", width=6,
+                   command=self._emergency_stop).pack(side="right")
 
         self.event_list = tk.Listbox(frame, height=8, font=("Consolas", 9),
                                      exportselection=False)
@@ -834,7 +810,7 @@ class MainWindow(tk.Tk):
         row2 = ttk.Frame(frame)
         row2.pack(fill="x")
         ttk.Label(row2, text="UV灯水平距离 (mm):").pack(side="left", padx=(16, 2), pady=4)
-        self.uv_dist_var = tk.StringVar(value="120")
+        self.uv_dist_var = tk.StringVar(value=fmt_pos(UV_OFFSET_DEFAULT))
         ttk.Entry(row2, textvariable=self.uv_dist_var, width=8).pack(side="left", padx=2)
         # 自动UV灯: 自动循环中 X 向终点移动时开灯，其他情况关灯
         self.auto_uv_var = tk.BooleanVar(value=False)
@@ -848,30 +824,19 @@ class MainWindow(tk.Tk):
         ttk.Checkbutton(row3, text="打印中维护闪喷", variable=self.flash_maintain_var
                         ).pack(side="left", padx=(16, 2), pady=4)
 
-        # 自动压墨：勾选后在自动循环的闪喷前执行压墨
+        # 自定义指令：用户输入原始指令发送到设备或扫描服务器
         row4 = ttk.Frame(frame)
         row4.pack(fill="x")
-        self.press_ink_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row4, text="打印中自动压墨", variable=self.press_ink_var
-                        ).pack(side="left", padx=(16, 2), pady=4)
-        self.press_ink_time_label_var = tk.StringVar(
-            value=f"(时长 {fmt_pos(PRESS_INK_DURATIONS[0])}s)")
-        ttk.Label(row4, textvariable=self.press_ink_time_label_var,
-                  foreground="gray").pack(side="left", padx=2)
-
-        # 自定义指令：用户输入原始指令发送到设备或扫描服务器
-        row5 = ttk.Frame(frame)
-        row5.pack(fill="x")
-        ttk.Label(row5, text="自定义指令:").pack(side="left", padx=(16, 2), pady=4)
+        ttk.Label(row4, text="自定义指令:").pack(side="left", padx=(16, 2), pady=4)
         self.custom_cmd_var = tk.StringVar()
-        cmd_entry = ttk.Entry(row5, textvariable=self.custom_cmd_var, width=20)
+        cmd_entry = ttk.Entry(row4, textvariable=self.custom_cmd_var, width=20)
         cmd_entry.pack(side="left", padx=2)
         cmd_entry.bind("<Return>", lambda e: self._send_custom_cmd())
         self.custom_target_var = tk.StringVar(value="设备")
-        ttk.Combobox(row5, textvariable=self.custom_target_var,
+        ttk.Combobox(row4, textvariable=self.custom_target_var,
                      values=["设备", "扫描服务器"], width=8,
                      state="readonly").pack(side="left", padx=2)
-        ttk.Button(row5, text="发送", width=6,
+        ttk.Button(row4, text="发送", width=6,
                    command=self._send_custom_cmd).pack(side="left", padx=4)
 
     def _build_log_frame(self, parent):
@@ -995,11 +960,6 @@ class MainWindow(tk.Tk):
                     self._append_log(
                         "[自动] 当前没有服务器打印任务，忽略打印完成事件\n")
                     return
-                if total_layers != self._job_total_layers:
-                    self._append_log(
-                        f"[自动] 打印完成事件 TOTAL_LAYERS={total_layers} "
-                        f"与当前任务总层数 {self._job_total_layers} 不一致，忽略\n")
-                    return
                 self._remove_event(line.strip())
                 self._complete_server_job()
                 return
@@ -1007,8 +967,20 @@ class MainWindow(tk.Tk):
             if m:
                 layer = int(m.group(1))
                 self._append_log(f"[图层] LAYER_START LAYER={layer}\n")
-                if (self._auto_active and self._auto_mode == "server"
-                        and self._layer_listening):
+                if (self._auto_active and self._auto_mode == "server"):
+                    # 新层事件优先级最高：丢弃上一层残留 PASS/ZERO，
+                    # 立即切换到当前层定位流程。
+                    self._pending.clear()
+                    self._auto_leg = "wait_layer"
+                    self.event_queue = deque(
+                        (ts, ev) for ts, ev in self.event_queue
+                        if not (PASS_READY_PATTERN.fullmatch(ev)
+                                or PASS_REMAINING_ZERO_PATTERN.fullmatch(ev))
+                    )
+                    self.event_list.delete(0, "end")
+                    for ts, ev in self.event_queue:
+                        self.event_list.insert("end", f"[{ts}] {ev}")
+                    self.event_count_var.set(f"{len(self.event_queue)} 条")
                     if 1 <= layer <= self._job_total_layers:
                         self._job_current_layer = layer
                         self._update_job_progress()
@@ -1021,7 +993,7 @@ class MainWindow(tk.Tk):
                         self._append_log(
                             f"[图层] LAYER={layer} 超出任务总层数 "
                             f"{self._job_total_layers}，忽略进度更新\n")
-                # 该事件已入队；若起始位置已就位，任意合法层都可以触发向终点运动
+                # 立即消费当前层并执行 Z/Y 定位，不受上一层状态影响
                 self._try_start_layer(layer)
                 return
             m = PASS_READY_PATTERN.match(line.strip())
@@ -1036,7 +1008,22 @@ class MainWindow(tk.Tk):
                 layer, pass_no = (int(value) for value in m.groups())
                 self._append_log(
                     f"[PASS] 剩余列数归零 LAYER={layer} PASS={pass_no}\n")
-                self._stop_x_on_pass_remaining_zero(line.strip(), layer, pass_no)
+                handled = self._stop_x_on_pass_remaining_zero(line.strip(), layer, pass_no)
+                if (not handled and self.auto_uv_var.get()
+                        and self._auto_active and self._auto_mode == "server"
+                        and self._auto_leg == "wait_pass_zero"):
+                    # 自动 UV 模式下 X 已到位，ZERO 晚到时直接衔接
+                    # 原急停后的计数、维护闪喷和等待逻辑。
+                    self._auto_leg = "end"
+                    self._auto_advance()
+                elif (not handled and self._auto_active
+                      and self._auto_mode == "server"
+                      and self._auto_leg == "wait_pass_zero"):
+                    # 事件可能因层号状态更新时序尚未同步；既然当前正等待
+                    # ZERO，直接消费该事件并继续，不让流程永久等待。
+                    self._remove_event(line.strip())
+                    self._auto_leg = "end"
+                    self._auto_advance()
                 return
             if "PRESS_INK" in line:
                 # 压墨完成/结果回送，仅记录日志
@@ -1171,9 +1158,8 @@ class MainWindow(tk.Tk):
             f"大循环剩余: {self._outer_remaining}，内循环剩余: {self._auto_remaining}")
 
     def _update_auto_counts(self):
-        """刷新闪喷计数和 X 循环计数显示。"""
-        self.auto_count_var.set(
-            f"闪喷计数: {self._flash_count}    X循环计数: {self._x_cycle_count}")
+        """刷新闪喷计数显示。"""
+        self.auto_count_var.set(f"闪喷计数: {self._flash_count}")
 
     def _update_job_progress(self):
         """刷新服务器打印任务的当前层/总层数显示。"""
@@ -1191,13 +1177,14 @@ class MainWindow(tk.Tk):
         由服务器广播事件（START_JOB / LAYER_START / PASS_READY）驱动。
         当前仅锁定 X/Y/Z 三轴（循环参数不参与锁定，下方流程不会用到）。
         """
-        if self._auto_active:
-            self._append_log("[自动] 已在自动循环中，忽略重复 START_JOB\n")
-            return
-        self._flash_count = 0
-        self._x_cycle_count = 0
-        self._update_auto_counts()
+        # 每次 START_JOB 都视为新任务，清空上一任务的队列、目标和定时器。
+        self._pending.clear()
         self._cancel_flash_pause()
+        self.event_queue.clear()
+        self.event_list.delete(0, "end")
+        self.event_count_var.set("0 条")
+        self._flash_count = 0
+        self._update_auto_counts()
         self._auto_active = True
         self._auto_mode = "server"
         self._y_start = self.positions["Y"]
@@ -1246,6 +1233,7 @@ class MainWindow(tk.Tk):
         if self.auto_uv_var.get():
             self._set_uv(False)
         self._y_start = 0.0
+        self._play_finish_sound()
         self.status_var.set("打印完成，全部流程已结束")
         self._append_log(
             "[自动] 打印完成，已结束全部流程并清空 Y 初始位置\n")
@@ -1277,18 +1265,17 @@ class MainWindow(tk.Tk):
             return
         try:
             uv_dist = float(self.uv_dist_var.get().strip())
-            if not (0 <= uv_dist <= X_END):
+            if not (0 <= uv_dist <= X_END_WITH_UV):
                 raise ValueError
         except ValueError:
             if self.auto_uv_var.get():
-                messagebox.showerror("错误", f"UV灯水平距离必须是 0 ~ {fmt_pos(X_END)} 之间的数字")
+                messagebox.showerror("错误", f"UV灯水平偏移必须是 0 ~ {fmt_pos(X_END_WITH_UV)} 之间的数字")
                 return
             uv_dist = X_END  # 未启用自动UV灯时该值无意义
         self._uv_dist = uv_dist
         # 闪喷间隔只由 config.toml 的 [flash].interval 配置，不在 UI 修改。
         self._flash_interval = FLASH_INTERVAL_DEFAULT
         self._flash_count = 0
-        self._x_cycle_count = 0
         self._update_auto_counts()
         self._cancel_flash_pause()
         self._auto_ystep = ystep
@@ -1346,73 +1333,26 @@ class MainWindow(tk.Tk):
         messagebox.showwarning("自动循环中止", reason)
 
     def _flash_pause(self):
-        """X 到达终点时暂停循环：先压墨（若启用），再闪喷"""
+        """达到闪喷间隔时，先 X 正向偏移再执行维护闪喷。"""
         self._flash_pausing = True
         self._append_log(
             f"[自动] X 到达终点，维护闪喷（间隔 {self._flash_interval}），暂停\n")
-        if self.press_ink_var.get():
-            # 1. Z 下降
-            self._z_drop_for_ink()
-            # 2. 发送压墨命令
-            seconds = self.press_ink_seconds
+        if (self._auto_mode == "server" and FLASH_X_OFFSET > 0):
+            target = self.positions["X"] + FLASH_X_OFFSET
+            if not (AXIS_LIMITS["X"][0] <= target <= AXIS_LIMITS["X"][1]):
+                self._auto_abort(
+                    f"维护闪喷前 X 正向偏移目标 {fmt_pos(target)} 超出行程 "
+                    f"[{fmt_pos(AXIS_LIMITS['X'][0])}, {fmt_pos(AXIS_LIMITS['X'][1])}]")
+                return
+            self._auto_leg = "server_flash_offset"
             self._append_log(
-                f"[自动] 发送压墨命令 PRESS_INK {fmt_pos(seconds)}\n")
-            self.scan.send(f"PRESS_INK {fmt_pos(seconds)}\r\n")
-            # 3. 循环警告音 + 弹窗等待手动刮墨
-            self._play_ink_warning_loop()
-            self.status_var.set("请手动刮墨...")
-            messagebox.showinfo("请手动刮墨", "请手动刮墨，完成后点击确定")
-            # 4. 关闭警告音，Z 回升，继续闪喷
-            self._stop_ink_warning()
-            self._z_rise_for_ink()
+                f"[自动] 维护闪喷前 X 正向偏移 {fmt_pos(FLASH_X_OFFSET)} "
+                f"-> {fmt_pos(target)}，等待到位后开启闪喷\n")
+            self.sender.send_command(f"X+{fmt_pos(FLASH_X_OFFSET)}")
+            self._wait_target("X", target)
+            self._auto_uv_update()
+            return
         self._do_flash_pause()
-
-    def _z_drop_for_ink(self):
-        """刮墨前 Z 轴下降（增量指令，带行程校验）"""
-        target = self.positions["Z"] - PRESS_INK_Z_DROP
-        if not (AXIS_LIMITS["Z"][0] <= target <= AXIS_LIMITS["Z"][1]):
-            self._append_log(
-                f"[自动] 压墨 Z 下降超出行程，跳过: 目标 {fmt_pos(target)}\n")
-            return
-        self.sender.send_command(f"Z-{fmt_pos(PRESS_INK_Z_DROP)}")
-        self._append_log(
-            f"[自动] 压墨 Z 下降 {fmt_pos(PRESS_INK_Z_DROP)} -> {fmt_pos(target)}\n")
-
-    def _z_rise_for_ink(self):
-        """刮墨完成后 Z 轴回升（增量指令，带行程校验）"""
-        target = self.positions["Z"] + PRESS_INK_Z_DROP
-        if not (AXIS_LIMITS["Z"][0] <= target <= AXIS_LIMITS["Z"][1]):
-            self._append_log(
-                f"[自动] 压墨 Z 回升超出行程，跳过: 目标 {fmt_pos(target)}\n")
-            return
-        self.sender.send_command(f"Z+{fmt_pos(PRESS_INK_Z_DROP)}")
-        self._append_log(
-            f"[自动] 压墨 Z 回升 {fmt_pos(PRESS_INK_Z_DROP)} -> {fmt_pos(target)}\n")
-
-    def _play_ink_warning_loop(self):
-        """循环播放 assets/warning.mp3（MCI，不阻塞）"""
-        try:
-            winmm = ctypes.windll.winmm
-            alias = "ink_warning"
-            winmm.mciSendStringW(f"stop {alias}", None, 0, None)
-            winmm.mciSendStringW(f"close {alias}", None, 0, None)
-            if winmm.mciSendStringW(f'open "{INK_WARNING_SOUND}" alias {alias}',
-                                    None, 0, None) == 0:
-                winmm.mciSendStringW(f"play {alias} repeat", None, 0, None)
-            else:
-                self._append_log(f"[提示] 警告音效无法播放: {INK_WARNING_SOUND}\n")
-        except Exception as e:
-            self._append_log(f"[提示] 警告音效播放失败: {e}\n")
-
-    def _stop_ink_warning(self):
-        """停止并释放警告音"""
-        try:
-            winmm = ctypes.windll.winmm
-            alias = "ink_warning"
-            winmm.mciSendStringW(f"stop {alias}", None, 0, None)
-            winmm.mciSendStringW(f"close {alias}", None, 0, None)
-        except Exception:
-            pass
 
     def _do_flash_pause(self):
         """压墨完成后（或未启用/失败），执行闪喷"""
@@ -1468,7 +1408,6 @@ class MainWindow(tk.Tk):
                 setattr(self, attr, None)
         self._flash_pausing = False
         self._flash_wait_off = False
-        self._stop_ink_warning()
 
     def _z_step_down(self):
         """X 循环累计计数达阈值时，按配置下降 Z（不阻塞手动循环）。"""
@@ -1486,23 +1425,21 @@ class MainWindow(tk.Tk):
         """服务端新层开始时先按 X 循环计数下降 Z，再让 Y 回初始位置。"""
         if not (self._auto_active and self._auto_mode == "server"):
             return
-        if self._x_cycle_count >= X_CYCLE_COUNT_LIMIT:
+        layer = self._active_layer
+        if layer > 0 and layer % X_CYCLE_COUNT_LIMIT == 0:
             target = self.positions["Z"] - X_CYCLE_Z_STEP
             if not (AXIS_LIMITS["Z"][0] <= target <= AXIS_LIMITS["Z"][1]):
                 self._auto_abort(
-                    f"X 循环计数已达 {self._x_cycle_count}，但 Z 下降目标 "
+                    f"打印层数 {layer} 达到 {X_CYCLE_COUNT_LIMIT} 的倍数，但 Z 下降目标 "
                     f"{fmt_pos(target)} 超出行程 "
                     f"[{fmt_pos(AXIS_LIMITS['Z'][0])}, {fmt_pos(AXIS_LIMITS['Z'][1])}]")
                 return
             self._auto_leg = "layer_zstep"
             self.sender.send_command(f"Z-{fmt_pos(X_CYCLE_Z_STEP)}")
             self._wait_target("Z", target)
-            self._x_cycle_count = 0
-            self._update_auto_counts()
             self._append_log(
-                f"[自动] 新层开始，X 循环计数达到配置阈值 "
-                f"{X_CYCLE_COUNT_LIMIT}，Z 下降 {fmt_pos(X_CYCLE_Z_STEP)} "
-                f"-> {fmt_pos(target)}，X 循环计数清零\n")
+                f"[自动] 打印到第 {layer} 层（达到 {X_CYCLE_COUNT_LIMIT} 的倍数），"
+                f"Z 下降 {fmt_pos(X_CYCLE_Z_STEP)} -> {fmt_pos(target)}\n")
             self._auto_uv_update()
             return
         self._start_server_layer_yhome()
@@ -1528,7 +1465,7 @@ class MainWindow(tk.Tk):
 
     def _begin_x_end_motion(self):
         """按配置文件的 X_END 开始 X 运动。"""
-        target = X_END
+        target = X_END_WITH_UV if (self._auto_mode == "server" and self.auto_uv_var.get()) else X_END
         self._auto_leg = "end"
         self._append_log(
             f"[自动] 使用配置文件的 X 终点位置 {fmt_pos(target)}\n")
@@ -1627,8 +1564,7 @@ class MainWindow(tk.Tk):
         """只用当前执行层/PASS 的 ZERO 事件急停 X；早到事件保留在队列。"""
         if not (self._auto_active
                 and self._auto_mode == "server"
-                and self._auto_leg == "end"
-                and "X" in self._pending):
+                and self._auto_leg in ("end", "wait_pass_zero")):
             return False
         if event is None:
             for _, queued_event in self.event_queue:
@@ -1643,21 +1579,28 @@ class MainWindow(tk.Tk):
                     layer = queued_layer
                     pass_no = queued_pass
                     break
-        if (event is None or layer != self._active_layer
-                or pass_no != self._pass_current):
+        # X 到位后处于 wait_pass_zero 时，层号可能因事件时序尚未同步；
+        # 当前正在等待的 PASS 号优先，允许层号随后再更新。
+        layer_ok = (layer == self._active_layer or self._auto_leg == "wait_pass_zero")
+        if (event is None or not layer_ok or pass_no != self._pass_current):
             return False
+        if self.auto_uv_var.get():
+            # 自动 UV 模式不急停；事件到达后消费并衔接终点后的处理。
+            self._remove_event(event)
+            if self._auto_leg == "wait_pass_zero":
+                self._auto_leg = "end"
+                self._auto_advance()
+            return True
         self._remove_event(event)
         self._pending.pop("X", None)
         self.sender.send_urgent(CMD_ESTOP)
         # 匹配事件被消费并真正发送 q 时才计数，避免早到、重复或不匹配事件误计。
         self._flash_count += 1
-        self._x_cycle_count += 1
         self._update_auto_counts()
         self._auto_uv_update()
         self._append_log(
             f"[自动] LAYER={layer} PASS={pass_no} 剩余列数变为 0，"
-            f"已发送 q 停止 X；闪喷计数={self._flash_count}，"
-            f"X循环计数={self._x_cycle_count}\n")
+            f"已发送 q 停止 X；闪喷计数={self._flash_count}\n")
         if (self.flash_maintain_var.get()
                 and self._flash_count >= self._flash_interval):
             self._flash_count = 0
@@ -1672,6 +1615,14 @@ class MainWindow(tk.Tk):
             return True
         self._start_server_stop_wait()
         return True
+
+    def _remove_matching_pass_zero(self):
+        """自动 UV 模式下消费当前 PASS 的 ZERO 事件但不发送急停。"""
+        for _, queued_event in list(self.event_queue):
+            match = PASS_REMAINING_ZERO_PATTERN.fullmatch(queued_event)
+            if match and int(match.group(1)) == self._active_layer and int(match.group(2)) == self._pass_current:
+                self._remove_event(queued_event)
+                return
 
     def _start_server_stop_wait(self):
         """进入服务端 PASS 急停后的配置等待。"""
@@ -1766,6 +1717,10 @@ class MainWindow(tk.Tk):
             # 达到配置阈值时先等待 Z 下降到位，再让 Y 回到任务初始位置。
             self._start_server_layer_yhome()
             return True
+        if self._auto_leg == "server_flash_offset":
+            # X 正向偏移到位后才开启维护闪喷。
+            self._do_flash_pause()
+            return True
         if self._auto_leg == "layer_yhome":
             # 每层开始时 Y 回到任务初始位置，到位后再进入 PASS 循环。
             self._auto_leg = "wait_pass_ready"
@@ -1799,20 +1754,32 @@ class MainWindow(tk.Tk):
             return True
         if self._auto_leg == "end":
             if self._auto_mode == "server":
-                # 正常流程一定会在移动中收到 PASS_REMAINING_ZERO 并急停，不会抵达 X_END。
-                # 此处仅作协议异常保护，防止意外落入手动任务的计数/闪喷/回程逻辑。
-                self._auto_leg = "unexpected_end"
+                if self.auto_uv_var.get():
+                    # 自动 UV 模式下不急停，完整移动至带 UV 终点后关闭 UV，
+                    # 再执行原急停后的计数、维护闪喷及等待逻辑。
+                    self._set_uv(False)
+                    self._remove_matching_pass_zero()
+                    self._flash_count += 1
+                    self._update_auto_counts()
+                    if (self.flash_maintain_var.get()
+                            and self._flash_count >= self._flash_interval):
+                        self._flash_count = 0
+                        self._update_auto_counts()
+                        self._auto_leg = "server_flash_pause"
+                        self._flash_pause()
+                    else:
+                        self._start_server_stop_wait()
+                    return True
+                # X 先到终点时，ZERO 事件可能尚未到达；进入等待状态，
+                # 由稍后收到的 PASS_REMAINING_ZERO 继续执行后续逻辑。
+                self._auto_leg = "wait_pass_zero"
                 self._append_log(
-                    f"[自动] 未收到 PASS_REMAINING_ZERO 即到达终点 {fmt_pos(X_END)}，"
-                    "已停止流程推进\n")
+                    f"[自动] X 已到达终点 {fmt_pos(X_END)}，等待 PASS_REMAINING_ZERO 事件\n")
+                self._stop_x_on_pass_remaining_zero()
                 return True
             # 到达终点 -> 计数；启用维护闪喷且达间隔时，先暂停闪喷再返回起始
             self._flash_count += 1
             # X 到达终点累计计数达阈值时，Z 轴下降（独立于闪喷计数）
-            self._x_cycle_count += 1
-            if self._x_cycle_count >= X_CYCLE_COUNT_LIMIT:
-                self._x_cycle_count = 0
-                self._z_step_down()
             if self.flash_maintain_var.get() and self._flash_count >= self._flash_interval:
                 self._flash_count = 0
                 self._update_auto_counts()
@@ -1822,6 +1789,10 @@ class MainWindow(tk.Tk):
             self._auto_leg = "home"
             self.sender.send_command(f"X={fmt_pos(X_HOME)}")
             self._wait_target("X", X_HOME)
+            return True
+        if self._auto_leg == "wait_pass_zero":
+            # 等待 PASS_REMAINING_ZERO 事件；事件处理器会触发后续流程。
+            self._stop_x_on_pass_remaining_zero()
             return True
         if self._auto_leg == "ystep":
             # Y 步进完成 -> 开始下一次内循环，向终点运动
@@ -1946,19 +1917,32 @@ class MainWindow(tk.Tk):
         self.roller_btn.config(text=f"滚子: {'运行' if self.roller_on else '停止'}")
 
     def _emergency_stop(self):
-        """急停：立即发送 q，打断所有运动，终止自动循环并全部解锁"""
+        """强制停止打印：发送 q，清空服务器任务状态并解锁所有轴。"""
         self.sender.send_urgent(CMD_ESTOP)
         self._auto_active = False
         self._auto_mode = None
+        self._auto_leg = "stopped"
         self._outer_remaining = 0
+        self._layer_listening = False
+        self._active_layer = 0
+        self._job_current_layer = 0
+        self._job_total_layers = 0
+        self._pass_current = 0
+        self._pass_total = 0
         self._pending.clear()
         self._cancel_flash_pause()
+        self.event_queue.clear()
+        self.event_list.delete(0, "end")
+        self.event_count_var.set("0 条")
+        self._update_job_progress()
+        self._update_pass_progress()
         self.cycle_info_var.set("")
         self.eta_var.set("")
+        self._y_start = 0.0
         self._unlock_all()
         if self.auto_uv_var.get():
             self._set_uv(False)
-        self._append_log("[急停] 已发送 q，打断所有指令\n")
+        self._append_log("[停止] 已发送 q，强制终止打印并清空任务事件\n")
 
     # ---------- 回调与日志 ----------
 
