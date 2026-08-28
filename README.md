@@ -147,6 +147,7 @@ flowchart TD
 | 键 | 说明 |
 | --- | --- |
 | `[auto_cycle] x_home / x_end` | X 轴往返端点 |
+| `[auto_cycle] y_home` | prehome 阶段 X 到位后，Y 移动到的起始位置 |
 | `[auto_cycle] x_end_withuv` | 自动 UV 开启时 PASS 使用的 X 终点 |
 | `[auto_cycle] uv_offset` | 自动 UV 开启阈值；X 达到该位置时开灯，默认 `120 mm` |
 | `[auto_cycle] pass_stop_wait_seconds` | PASS 到达 X 终点后的等待时间（秒） |

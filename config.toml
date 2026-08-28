@@ -19,6 +19,8 @@ max = 125.0
 # 同时用于 X 轴预设中的"起始位置"/"终点位置"按钮
 [auto_cycle]
 x_home = 0.0
+# prehome 阶段 X 到位后，Y 移动到的起始位置（mm）
+y_home = 10.0
 x_end = 200.0
 x_end_withuv = 220.0
 # 自动 UV 灯开启的 X 轴水平偏移 (mm)

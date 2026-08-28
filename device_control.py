@@ -68,6 +68,7 @@ _DEFAULT_X_HOME = 0.0
 _DEFAULT_X_END = 220.0
 _DEFAULT_X_END_WITH_UV = 220.0
 _DEFAULT_UV_OFFSET = 120.0
+_DEFAULT_Y_HOME = 0.0
 
 
 def _load_config() -> dict:
@@ -107,6 +108,15 @@ def _load_uv_offset(cfg: dict) -> float:
         return value if value >= 0 else _DEFAULT_UV_OFFSET
     except (KeyError, TypeError, ValueError):
         return _DEFAULT_UV_OFFSET
+
+
+def _load_y_home(cfg: dict) -> float:
+    """prehome 阶段 X 到位后使用的 Y 起始位置。"""
+    try:
+        value = float(cfg["auto_cycle"].get("y_home", _DEFAULT_Y_HOME))
+        return value
+    except (KeyError, TypeError, ValueError):
+        return _DEFAULT_Y_HOME
 
 
 _DEFAULT_PASS_STOP_WAIT_SECONDS = 2.0
@@ -251,6 +261,7 @@ _CONFIG = _load_config()
 AXIS_LIMITS = _load_axis_limits(_CONFIG)
 X_HOME, X_END, X_END_WITH_UV = _load_cycle_endpoints(_CONFIG)
 UV_OFFSET_DEFAULT = _load_uv_offset(_CONFIG)
+Y_HOME = _load_y_home(_CONFIG)
 PASS_STOP_WAIT_SECONDS = _load_pass_stop_wait_seconds(_CONFIG)
 PASS_STOP_WAIT_MS = int(round(PASS_STOP_WAIT_SECONDS * 1000))
 JOG_STEPS = _load_jog_steps(_CONFIG)
@@ -1135,6 +1146,9 @@ class MainWindow(tk.Tk):
         if self._auto_active:
             # 自动循环期间 X/Y/Z 三轴全部锁定，到达后不单独解锁
             if not self._pending:
+                if arrived:
+                    self._append_log(
+                        f"[自动] {','.join(arrived)} 已到位，继续执行下一流程\n")
                 self._auto_advance()
                 self._auto_uv_update()
                 if not self._auto_active:
@@ -1724,6 +1738,19 @@ class MainWindow(tk.Tk):
                 self._y_start = self.positions["Y"]
                 self._append_log(
                     f"[自动] 记录 Y 初始位置 {fmt_pos(self._y_start)}\n")
+            # X 回到 HOME 后，再将 Y 移动到配置的 prehome 起始位置。
+            if not (AXIS_LIMITS["Y"][0] <= Y_HOME <= AXIS_LIMITS["Y"][1]):
+                self._auto_abort(
+                    f"prehome Y 起始位置 {fmt_pos(Y_HOME)} 超出行程")
+                return False
+            self._auto_leg = "prehome_yhome"
+            self._append_log(
+                f"[自动] prehome 完成，移动 Y 到起始位置 {fmt_pos(Y_HOME)}\n")
+            self.sender.send_command(f"Y={fmt_pos(Y_HOME)}")
+            self._wait_target("Y", Y_HOME)
+            return True
+        if self._auto_leg == "prehome_yhome":
+            # Y 到位后才开始等待本任务的 LAYER_START。
             self._auto_leg = "wait_layer"
             # 从队列消费任意合法的 LAYER_START；存在则先让 Y 回任务初始位置。
             self._try_start_layer()
@@ -1751,6 +1778,10 @@ class MainWindow(tk.Tk):
             return True
         if self._auto_leg == "pass_ystep":
             # 当前 PASS 的 Y 相对移动到位后，再执行动态 X 终点流程。
+            if self._pending:
+                # 防御性检查：Y 未确认到位时不得发送 X。
+                return True
+            self._append_log("[自动] PASS Y 已到位，开始移动 X 到终点\n")
             self._begin_x_end_motion()
             return True
         if self._auto_leg == "pass_return_home":
