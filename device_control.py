@@ -50,7 +50,8 @@ PRINT_JOB_COMPLETED_PATTERN = re.compile(
     r"EVENT PRINT_JOB_COMPLETED TOTAL_LAYERS=(\d+)")
 LAYER_START_PATTERN = re.compile(r"EVENT LAYER_START LAYER=(\d+)")
 PASS_READY_PATTERN = re.compile(
-    r"EVENT PASS_READY CURRENT=(\d+) TOTAL=(\d+) STEP=([+-]?\d+) EMPTY=(\d+)")
+    # STEP 由扫描服务器以微米表示，可能带小数（例如 -8.975）。
+    r"EVENT PASS_READY CURRENT=(\d+) TOTAL=(\d+) STEP=([+-]?\d+(?:\.\d+)?) EMPTY=(\d+)")
 PASS_REMAINING_ZERO_PATTERN = re.compile(
     r"EVENT PASS_REMAINING_ZERO LAYER=(\d+) PASS=(\d+) REMAINING=0")
 
@@ -998,7 +999,9 @@ class MainWindow(tk.Tk):
                 return
             m = PASS_READY_PATTERN.match(line.strip())
             if m:
-                cur, total, step, empty = (int(value) for value in m.groups())
+                cur, total = (int(value) for value in m.groups()[:2])
+                step = float(m.group(3))
+                empty = int(m.group(4))
                 self._append_log(
                     f"[PASS] 就绪 CURRENT={cur} TOTAL={total} STEP={step} EMPTY={empty}\n")
                 self._try_start_pass(line.strip(), cur, total, step, empty)
@@ -1081,6 +1084,14 @@ class MainWindow(tk.Tk):
 
     def _wait_target(self, axis: str, target: float):
         """登记运动目标并锁定该轴的控件，直到设备上报到达"""
+        # If the axis is already at the requested target, some devices do not
+        # emit a subsequent status frame.  Advance immediately so the
+        # automatic workflow cannot remain stuck waiting for arrival.
+        if self._auto_active and abs(self.positions.get(axis, target) - target) <= POS_TOLERANCE:
+            self._pending.pop(axis, None)
+            self._auto_advance()
+            self._auto_uv_update()
+            return
         self._pending[axis] = target
         self._set_axis_enabled(axis, False)
         if not self._auto_active:
@@ -1498,8 +1509,9 @@ class MainWindow(tk.Tk):
             for _, queued_event in reversed(self.event_queue):
                 match = PASS_READY_PATTERN.fullmatch(queued_event)
                 if match:
-                    current, total, step, empty = (
-                        int(value) for value in match.groups())
+                    current, total = (int(value) for value in match.groups()[:2])
+                    step = float(match.group(3))
+                    empty = int(match.group(4))
                     event = queued_event
                     break
         if (event is None or current is None or total is None
