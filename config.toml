@@ -18,15 +18,16 @@ max = 125.0
 # 自动循环 X 轴往返端点 (mm)
 # 同时用于 X 轴预设中的"起始位置"/"终点位置"按钮
 [auto_cycle]
-x_home = 0.0
+x_home = -5.0
+x_zero = 0.0
 # prehome 阶段 X 到位后，Y 移动到的起始位置（mm）
-y_home = 10.0
+y_home = 50.0
 x_end = 200.0
 x_end_withuv = 220.0
 # 自动 UV 灯开启的 X 轴水平偏移 (mm)
 uv_offset = 120.0
 # 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
-pass_stop_wait_seconds = 1.0
+pass_stop_wait_seconds = 0.3
 
 # 点动步长选项 (mm)，UI 中显示为单选按钮，默认选中第一个
 [jog]
@@ -36,7 +37,7 @@ steps = [1, 5, 10, 50]
 # 默认即"200 层 0.5mm"；触发阈值由 layers 直接决定
 [z_step]
 layers = 200
-step = 0.5
+step = 0.4
 
 # 闪喷：interval 为累计多少次 X 循环/急停后执行一次维护闪喷（仅在此处设置）
 # pause_ms 为维护闪喷时在终点暂停的时长 (ms)

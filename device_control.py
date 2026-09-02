@@ -65,6 +65,7 @@ _DEFAULT_AXIS_LIMITS = {
     "Z": (-60.0, 125.0),
 }
 _DEFAULT_X_HOME = 0.0
+_DEFAULT_X_ZERO = 1.0
 _DEFAULT_X_END = 220.0
 _DEFAULT_X_END_WITH_UV = 220.0
 _DEFAULT_UV_OFFSET = 120.0
@@ -118,6 +119,17 @@ def _load_y_home(cfg: dict) -> float:
     except (KeyError, TypeError, ValueError):
         return _DEFAULT_Y_HOME
 
+
+
+
+
+def _load_x_zero(cfg: dict) -> float:
+    """X 轴零点位置预设（mm）。"""
+    try:
+        value = float(cfg["auto_cycle"].get("x_zero", _DEFAULT_X_ZERO))
+        return value
+    except (KeyError, TypeError, ValueError):
+        return _DEFAULT_X_ZERO
 
 _DEFAULT_PASS_STOP_WAIT_SECONDS = 2.0
 
@@ -262,6 +274,7 @@ AXIS_LIMITS = _load_axis_limits(_CONFIG)
 X_HOME, X_END, X_END_WITH_UV = _load_cycle_endpoints(_CONFIG)
 UV_OFFSET_DEFAULT = _load_uv_offset(_CONFIG)
 Y_HOME = _load_y_home(_CONFIG)
+X_ZERO = _load_x_zero(_CONFIG)
 PASS_STOP_WAIT_SECONDS = _load_pass_stop_wait_seconds(_CONFIG)
 PASS_STOP_WAIT_MS = int(round(PASS_STOP_WAIT_SECONDS * 1000))
 JOG_STEPS = _load_jog_steps(_CONFIG)
@@ -697,7 +710,7 @@ class MainWindow(tk.Tk):
         quick_x = ttk.Frame(frame)
         quick_x.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_x, text="X 轴预设:").pack(side="left", padx=4)
-        for text, target in [("零点位置 (1)", 1),
+        for text, target in [(f"零点位置 ({fmt_pos(X_ZERO)})", X_ZERO),
                              (f"起始位置 ({fmt_pos(X_HOME)})", X_HOME),
                              (f"终点位置 ({fmt_pos(X_END)})", X_END)]:
             b = ttk.Button(quick_x, text=text, width=14,
@@ -1198,7 +1211,8 @@ class MainWindow(tk.Tk):
         self._update_auto_counts()
         self._auto_active = True
         self._auto_mode = "server"
-        self._y_start = self.positions["Y"]
+        # Y 起始位置统一使用配置项，不再记录任务开始时的当前位置。
+        self._y_start = Y_HOME
         self._job_current_layer = 0
         self._job_total_layers = total_layers
         self._active_layer = 0
@@ -1213,9 +1227,8 @@ class MainWindow(tk.Tk):
         # 仅锁定 X/Y/Z 三轴
         for axis in AXIS_LIMITS:
             self._set_axis_enabled(axis, False)
-        # 锁定后先记录任务开始时的 Y 位置，再移动 X 到起始位置
         self._append_log(
-            f"[自动] 记录 Y 初始位置 {fmt_pos(self._y_start)}\n")
+            f"[自动] 使用配置的 Y 起始位置 {fmt_pos(self._y_start)}\n")
         self._auto_leg = "prehome"
         self._append_log(f"[自动] 移动 X 到起始位置 {fmt_pos(X_HOME)}\n")
         self.sender.send_command(f"X={fmt_pos(X_HOME)}")
@@ -1306,7 +1319,7 @@ class MainWindow(tk.Tk):
         self._inner_total = count
         self._auto_remaining = count
         self._outer_remaining = outer
-        self._y_start = self.positions["Y"]
+        self._y_start = Y_HOME
         self._auto_active = True
         self._auto_mode = "manual"
         self._auto_eta = self._estimate_auto_time(count, outer, ystep)
@@ -1733,11 +1746,6 @@ class MainWindow(tk.Tk):
     def _auto_advance(self) -> bool:
         """一段到达后推进自动循环，返回 True 表示已发出下一段"""
         if self._auto_leg == "prehome":
-            # 手动流程在 prehome 到位后记录 Y；服务器流程已在移动 X 前记录，不能在此覆盖。
-            if self._auto_mode == "manual":
-                self._y_start = self.positions["Y"]
-                self._append_log(
-                    f"[自动] 记录 Y 初始位置 {fmt_pos(self._y_start)}\n")
             # X 回到 HOME 后，再将 Y 移动到配置的 prehome 起始位置。
             if not (AXIS_LIMITS["Y"][0] <= Y_HOME <= AXIS_LIMITS["Y"][1]):
                 self._auto_abort(
