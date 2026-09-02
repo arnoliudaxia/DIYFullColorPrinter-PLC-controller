@@ -24,6 +24,9 @@ x_zero = 0.0
 y_home = 50.0
 x_end = 200.0
 x_end_withuv = 220.0
+# X 轴速度（1~100）：去程为起始位置到终点，来程为终点返回起始位置
+x_speed_outbound = 60
+x_speed_return = 90
 # 自动 UV 灯开启的 X 轴水平偏移 (mm)
 uv_offset = 120.0
 # 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
@@ -61,6 +64,16 @@ press_z = 70.0
 # UI：整体缩放系数、窗口宽高（按缩放系数放大）
 # 两列布局：左侧连接/服务/设备/日志，右侧轴控制，窗口加宽减高
 # column_widths: 两列宽度 (逻辑像素) = [左列, 右列]，窗口拉宽时多余宽度分配给左列
+# PLC_server：PLC/设备控制服务器，负责三轴运动及设备状态通信
+[PLC_server]
+host = "192.168.1.88"
+port = 2001
+
+# printer_server：打印扫描服务器，负责打印流程事件、闪喷和压墨指令
+[printer_server]
+host = "127.0.0.1"
+port = 19090
+
 [ui]
 scale = 1.6
 window_size = [660, 520]

@@ -70,6 +70,8 @@ _DEFAULT_X_END = 220.0
 _DEFAULT_X_END_WITH_UV = 220.0
 _DEFAULT_UV_OFFSET = 120.0
 _DEFAULT_Y_HOME = 0.0
+_DEFAULT_X_SPEED_OUTBOUND = 60
+_DEFAULT_X_SPEED_RETURN = 90
 
 
 def _load_config() -> dict:
@@ -80,6 +82,23 @@ def _load_config() -> dict:
             return tomllib.load(f)
     except (OSError, ValueError, ImportError):
         return {}
+
+
+def _load_server_endpoint(cfg: dict, section: str, default_host: str,
+                          default_port: int):
+    """Load a server host/port pair from config.toml."""
+    host, port = default_host, default_port
+    try:
+        raw = cfg.get(section, {})
+        value = str(raw.get("host", raw.get("ip", host))).strip()
+        if value:
+            host = value
+        parsed = int(raw.get("port", port))
+        if 1 <= parsed <= 65535:
+            port = parsed
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return host, port
 
 
 def _load_axis_limits(cfg: dict) -> dict:
@@ -118,6 +137,20 @@ def _load_y_home(cfg: dict) -> float:
         return value
     except (KeyError, TypeError, ValueError):
         return _DEFAULT_Y_HOME
+
+
+def _load_x_speeds(cfg: dict):
+    """Load X-axis outbound (home→end) and return (end→home) speeds."""
+    outbound, return_speed = _DEFAULT_X_SPEED_OUTBOUND, _DEFAULT_X_SPEED_RETURN
+    try:
+        section = cfg.get("auto_cycle", {})
+        outbound = int(section.get("x_speed_outbound", outbound))
+        return_speed = int(section.get("x_speed_return", return_speed))
+        if not (1 <= outbound <= 100 and 1 <= return_speed <= 100):
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        outbound, return_speed = _DEFAULT_X_SPEED_OUTBOUND, _DEFAULT_X_SPEED_RETURN
+    return outbound, return_speed
 
 
 
@@ -270,10 +303,13 @@ def _load_ui(cfg: dict):
 
 
 _CONFIG = _load_config()
+DEVICE_HOST, DEVICE_PORT = _load_server_endpoint(_CONFIG, "PLC_server", DEFAULT_HOST, DEFAULT_PORT)
+SCAN_SERVER_HOST, SCAN_SERVER_PORT = _load_server_endpoint(_CONFIG, "printer_server", SCAN_HOST, SCAN_PORT)
 AXIS_LIMITS = _load_axis_limits(_CONFIG)
 X_HOME, X_END, X_END_WITH_UV = _load_cycle_endpoints(_CONFIG)
 UV_OFFSET_DEFAULT = _load_uv_offset(_CONFIG)
 Y_HOME = _load_y_home(_CONFIG)
+X_SPEED_OUTBOUND, X_SPEED_RETURN = _load_x_speeds(_CONFIG)
 X_ZERO = _load_x_zero(_CONFIG)
 PASS_STOP_WAIT_SECONDS = _load_pass_stop_wait_seconds(_CONFIG)
 PASS_STOP_WAIT_MS = int(round(PASS_STOP_WAIT_SECONDS * 1000))
@@ -622,31 +658,15 @@ class MainWindow(tk.Tk):
         frame = ttk.LabelFrame(parent, text="连接设置")
         frame.pack(fill="x", padx=8, pady=6)
 
-        ttk.Label(frame, text="IP 地址:").grid(row=0, column=0, padx=4, pady=6)
-        self.ip_var = tk.StringVar(value=DEFAULT_HOST)
-        ttk.Entry(frame, textvariable=self.ip_var, width=15).grid(row=0, column=1, padx=4)
-
-        ttk.Label(frame, text="端口:").grid(row=0, column=2, padx=4)
-        self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
-        ttk.Entry(frame, textvariable=self.port_var, width=7).grid(row=0, column=3, padx=4)
-
         self.connect_btn = ttk.Button(frame, text="连接", command=self._toggle_connect)
-        self.connect_btn.grid(row=0, column=4, padx=8)
+        self.connect_btn.grid(row=0, column=0, padx=8, pady=6)
 
     def _build_scan_frame(self, parent):
         frame = ttk.LabelFrame(parent, text="打印服务进程")
         frame.pack(fill="x", padx=8, pady=4)
 
-        ttk.Label(frame, text="IP 地址:").grid(row=0, column=0, padx=4, pady=6)
-        self.scan_ip_var = tk.StringVar(value=SCAN_HOST)
-        ttk.Entry(frame, textvariable=self.scan_ip_var, width=15).grid(row=0, column=1, padx=4)
-
-        ttk.Label(frame, text="端口:").grid(row=0, column=2, padx=4)
-        self.scan_port_var = tk.StringVar(value=str(SCAN_PORT))
-        ttk.Entry(frame, textvariable=self.scan_port_var, width=7).grid(row=0, column=3, padx=4)
-
         self.scan_btn = ttk.Button(frame, text="连接", command=self._toggle_scan)
-        self.scan_btn.grid(row=0, column=4, padx=8)
+        self.scan_btn.grid(row=0, column=0, padx=8, pady=6)
 
         self.scan_ready_var = tk.StringVar(value="未连接")
         ttk.Label(frame, textvariable=self.scan_ready_var,
@@ -885,27 +905,15 @@ class MainWindow(tk.Tk):
         if self.sender.connected:
             self.sender.disconnect()
         else:
-            host = self.ip_var.get().strip()
-            try:
-                port = int(self.port_var.get().strip())
-            except ValueError:
-                messagebox.showerror("错误", "端口必须是数字")
-                return
             threading.Thread(target=self.sender.connect,
-                             args=(host, port), daemon=True).start()
+                             args=(DEVICE_HOST, DEVICE_PORT), daemon=True).start()
 
     def _toggle_scan(self):
         if self.scan.connected:
             self.scan.disconnect()
         else:
-            host = self.scan_ip_var.get().strip()
-            try:
-                port = int(self.scan_port_var.get().strip())
-            except ValueError:
-                messagebox.showerror("错误", "端口必须是数字")
-                return
             threading.Thread(target=self.scan.connect,
-                             args=(host, port), daemon=True).start()
+                             args=(SCAN_SERVER_HOST, SCAN_SERVER_PORT), daemon=True).start()
 
     # ---------- 扫描服务器回调 ----------
 
@@ -1168,12 +1176,12 @@ class MainWindow(tk.Tk):
                     # 循环刚结束/中止
                     self._unlock_auto_group()
                     self.status_var.set(
-                        f"已连接 {self.ip_var.get()}:{self.port_var.get()}（自动循环结束）")
+                        f"已连接 {DEVICE_HOST}:{DEVICE_PORT}（自动循环结束）")
             return  # 自动循环期间三轴保持锁定
         for a in arrived:
             self._set_axis_enabled(a, True)
         if not self._pending:
-            self.status_var.set(f"已连接 {self.ip_var.get()}:{self.port_var.get()}（已到达目标位置）")
+            self.status_var.set(f"已连接 {DEVICE_HOST}:{DEVICE_PORT}（已到达目标位置）")
 
     # ---------- X 轴自动循环 ----------
 
@@ -1513,10 +1521,17 @@ class MainWindow(tk.Tk):
             return
         self._begin_x_end_motion()
 
+    def _set_x_speed(self, speed: int):
+        """Set PLC X-axis speed (1..100) before a PASS movement."""
+        speed = max(1, min(100, int(speed)))
+        self.sender.send_command(f"V={speed}")
+        self._append_log(f"[自动] 设置 X 轴速度 V={speed}\n")
+
     def _begin_x_end_motion(self):
         """按配置文件的 X_END 开始 X 运动。"""
         target = X_END_WITH_UV if (self._auto_mode == "server" and self.auto_uv_var.get()) else X_END
         self._auto_leg = "end"
+        self._set_x_speed(X_SPEED_OUTBOUND)
         self._append_log(
             f"[自动] 使用配置文件的 X 终点位置 {fmt_pos(target)}\n")
         self.sender.send_command(f"X={fmt_pos(target)}")
@@ -1604,6 +1619,7 @@ class MainWindow(tk.Tk):
         self._append_log(
             f"[自动] PASS {self._pass_current}/{self._pass_total} 完成，"
             f"X 返回起始位置 {fmt_pos(X_HOME)}，到位后判断 CURRENT < TOTAL\n")
+        self._set_x_speed(X_SPEED_RETURN)
         self.sender.send_command(f"X={fmt_pos(X_HOME)}")
         self._wait_target("X", X_HOME)
         self._auto_uv_update()
@@ -1837,6 +1853,7 @@ class MainWindow(tk.Tk):
                 return True
             self._update_auto_counts()
             self._auto_leg = "home"
+            self._set_x_speed(X_SPEED_RETURN)
             self.sender.send_command(f"X={fmt_pos(X_HOME)}")
             self._wait_target("X", X_HOME)
             return True
