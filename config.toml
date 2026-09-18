@@ -25,8 +25,8 @@ y_home = 50.0
 x_end = 200.0
 x_end_withuv = 220.0
 # X 轴速度（1~100）：去程为起始位置到终点，来程为终点返回起始位置
-x_speed_outbound = 60
-x_speed_return = 90
+x_speed_outbound = 100
+x_speed_return = 100
 # 自动 UV 灯开启的 X 轴水平偏移 (mm)
 uv_offset = 120.0
 # 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
@@ -39,16 +39,17 @@ steps = [1, 5, 10, 50]
 # Z 轴下降：每 layers 层（X 到达终点次数）下降 step (mm)
 # 默认即"200 层 0.5mm"；触发阈值由 layers 直接决定
 [z_step]
-layers = 200
-step = 0.4
+layers = 77
+step = 1.0
 
 # 闪喷：interval 为累计多少次 X 循环/急停后执行一次维护闪喷（仅在此处设置）
 # pause_ms 为维护闪喷时在终点暂停的时长 (ms)
 # x_offset 为开启维护闪喷前 X 轴正向偏移量 (mm)
 [flash]
-interval = 10
-pause_ms = 2000
-x_offset=20
+interval = 50
+pause_ms = 1300
+x_offset=5
+wait_timeout_ms = 5000
 
 # 压墨：勾选"自动压墨"时，自动循环闪喷前执行：
 #   Z 下降 z_drop → 发送 PRESS_INK <所选时长> 秒 → 循环播放 warning.mp3 并弹窗"请手动刮墨"

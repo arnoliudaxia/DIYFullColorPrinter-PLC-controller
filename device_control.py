@@ -216,6 +216,7 @@ def _load_z_step(cfg: dict):
 
 _DEFAULT_FLASH_PAUSE_MS = 2000
 _DEFAULT_FLASH_X_OFFSET = 0.0
+_DEFAULT_FLASH_WAIT_TIMEOUT_MS = 2000
 
 
 def _load_flash_interval(cfg: dict) -> int:
@@ -254,6 +255,18 @@ def _load_flash_x_offset(cfg: dict) -> float:
     except (KeyError, TypeError, ValueError):
         offset = _DEFAULT_FLASH_X_OFFSET
     return offset
+
+
+def _load_flash_wait_timeout(cfg: dict) -> int:
+    """维护闪喷结束命令发出后的等待回送超时时间（ms）。 """
+    ms = _DEFAULT_FLASH_WAIT_TIMEOUT_MS
+    try:
+        ms = int(float(cfg["flash"]["wait_timeout_ms"]))
+        if ms < 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        pass
+    return ms
 
 
 _DEFAULT_PRESS_Z_PRESET = 70.0
@@ -318,6 +331,7 @@ X_CYCLE_COUNT_LIMIT, X_CYCLE_Z_STEP = _load_z_step(_CONFIG)
 FLASH_INTERVAL_DEFAULT = _load_flash_interval(_CONFIG)
 FLASH_PAUSE_MS = _load_flash_pause(_CONFIG)
 FLASH_X_OFFSET = _load_flash_x_offset(_CONFIG)
+FLASH_WAIT_TIMEOUT_MS = _load_flash_wait_timeout(_CONFIG)
 PRESS_INK_Z_PRESET = _load_press_ink(_CONFIG)
 PRESS_INK_DURATIONS = _load_press_ink_durations(_CONFIG)
 UI_SCALE, WIN_SIZE, COL_WIDTHS = _load_ui(_CONFIG)
@@ -1430,7 +1444,7 @@ class MainWindow(tk.Tk):
             self._append_log("[自动] 发送结束闪喷命令\n")
             self._send_flash()
             self.status_var.set("结束闪喷中...")
-            self._flash_wait_after = self.after(FLASH_PAUSE_MS, self._flash_wait_timeout)
+            self._flash_wait_after = self.after(FLASH_WAIT_TIMEOUT_MS, self._flash_wait_timeout)
             return
         self._proceed_after_flash()
 
@@ -1791,6 +1805,7 @@ class MainWindow(tk.Tk):
             return True
         if self._auto_leg == "server_flash_offset":
             # X 正向偏移到位后才开启维护闪喷。
+            self._auto_leg = "server_flash_pause"
             self._do_flash_pause()
             return True
         if self._auto_leg == "layer_yhome":
