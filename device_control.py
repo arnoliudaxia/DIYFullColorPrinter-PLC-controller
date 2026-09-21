@@ -139,6 +139,23 @@ def _load_y_home(cfg: dict) -> float:
         return _DEFAULT_Y_HOME
 
 
+_DEFAULT_Y_TIMEOUT_MS = 10000
+
+
+def _load_y_timeout_ms(cfg: dict) -> int:
+    """自动流程 Y 运动指令发出后的到位超时时间（ms），超时未到位自动重发指令。
+
+    0 表示关闭重发，只做无限等待。
+    """
+    try:
+        ms = int(float(cfg["auto_cycle"].get("y_timeout_ms", _DEFAULT_Y_TIMEOUT_MS)))
+        if ms < 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        ms = _DEFAULT_Y_TIMEOUT_MS
+    return ms
+
+
 def _load_x_speeds(cfg: dict):
     """Load X-axis outbound (home→end) and return (end→home) speeds."""
     outbound, return_speed = _DEFAULT_X_SPEED_OUTBOUND, _DEFAULT_X_SPEED_RETURN
@@ -322,6 +339,7 @@ AXIS_LIMITS = _load_axis_limits(_CONFIG)
 X_HOME, X_END, X_END_WITH_UV = _load_cycle_endpoints(_CONFIG)
 UV_OFFSET_DEFAULT = _load_uv_offset(_CONFIG)
 Y_HOME = _load_y_home(_CONFIG)
+Y_TIMEOUT_MS = _load_y_timeout_ms(_CONFIG)
 X_SPEED_OUTBOUND, X_SPEED_RETURN = _load_x_speeds(_CONFIG)
 X_ZERO = _load_x_zero(_CONFIG)
 PASS_STOP_WAIT_SECONDS = _load_pass_stop_wait_seconds(_CONFIG)
@@ -585,6 +603,8 @@ class MainWindow(tk.Tk):
 
         # 运动中的等待目标 {轴: 目标位置}，某轴非空时只锁定该轴的控件
         self._pending = {}
+        # 自动流程中各轴"到位超时重发指令"的定时器 {轴: after_id}
+        self._retry_timers = {}
         # 每轴独立的运动控件 + 自动循环控件（设备控制 UV/滚子 不参与锁定）
         self.axis_widgets = {axis: [] for axis in AXIS_LIMITS}
         self.auto_widgets = []
@@ -1018,6 +1038,7 @@ class MainWindow(tk.Tk):
                     # 新层事件优先级最高：丢弃上一层残留 PASS/ZERO，
                     # 立即切换到当前层定位流程。
                     self._pending.clear()
+                    self._cancel_all_axis_retries()
                     self._auto_leg = "wait_layer"
                     self.event_queue = deque(
                         (ts, ev) for ts, ev in self.event_queue
@@ -1128,13 +1149,18 @@ class MainWindow(tk.Tk):
 
     # ---------- 运动锁定（按轴独立） ----------
 
-    def _wait_target(self, axis: str, target: float):
-        """登记运动目标并锁定该轴的控件，直到设备上报到达"""
+    def _wait_target(self, axis: str, target: float, retry_timeout_ms: int = None):
+        """登记运动目标并锁定该轴的控件，直到设备上报到达。
+
+        retry_timeout_ms: 自动流程中发送指令后超时未到位时，自动按目标
+        绝对位置重新发送指令（None/0 表示关闭重发，无限等待）。
+        """
         # If the axis is already at the requested target, some devices do not
         # emit a subsequent status frame.  Advance immediately so the
         # automatic workflow cannot remain stuck waiting for arrival.
         if self._auto_active and abs(self.positions.get(axis, target) - target) <= POS_TOLERANCE:
             self._pending.pop(axis, None)
+            self._cancel_axis_retry(axis)
             self._auto_advance()
             self._auto_uv_update()
             return
@@ -1142,6 +1168,44 @@ class MainWindow(tk.Tk):
         self._set_axis_enabled(axis, False)
         if not self._auto_active:
             self.status_var.set(f"{axis} 轴运动中... 到达目标位置后才能再次操作该轴")
+        if retry_timeout_ms:
+            self._schedule_axis_retry(axis, target, retry_timeout_ms)
+
+    def _cancel_axis_retry(self, axis: str):
+        """取消某轴的到位超时重发定时器。"""
+        after_id = self._retry_timers.pop(axis, None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+
+    def _cancel_all_axis_retries(self):
+        """取消所有轴的到位超时重发定时器。"""
+        for axis in list(self._retry_timers):
+            self._cancel_axis_retry(axis)
+
+    def _schedule_axis_retry(self, axis: str, target: float, timeout_ms: int):
+        """超时仍未到位时重新发送一次目标绝对位置指令，而不是无限等待。
+
+        重发使用绝对位置指令：若设备已部分执行了上一次相对移动，
+        重发相对指令会导致越位累积，绝对指令则天然幂等。
+        """
+        self._cancel_axis_retry(axis)
+
+        def _on_timeout():
+            self._retry_timers.pop(axis, None)
+            if not self._auto_active or self._pending.get(axis) != target:
+                return  # 已到位、目标已变更或循环已结束
+            # 设备只接受两位小数的坐标，浮点目标值必须格式化后再发送
+            cmd = f"{axis}={target:.2f}"
+            self._append_log(
+                f"[自动] {axis} 轴 {timeout_ms} ms 内未到位，"
+                f"重新发送指令 {cmd}\n")
+            self.sender.send_command(cmd)
+            self._schedule_axis_retry(axis, target, timeout_ms)
+
+        self._retry_timers[axis] = self.after(timeout_ms, _on_timeout)
 
     def _set_axis_enabled(self, axis: str, enabled: bool):
         state = "normal" if enabled else "disabled"
@@ -1176,6 +1240,7 @@ class MainWindow(tk.Tk):
                    if abs(self.positions[a] - t) <= POS_TOLERANCE]
         for a in arrived:
             del self._pending[a]
+            self._cancel_axis_retry(a)
         if not arrived:
             return
         if self._auto_active:
@@ -1225,6 +1290,7 @@ class MainWindow(tk.Tk):
         """
         # 每次 START_JOB 都视为新任务，清空上一任务的队列、目标和定时器。
         self._pending.clear()
+        self._cancel_all_axis_retries()
         self._cancel_flash_pause()
         self.event_queue.clear()
         self.event_list.delete(0, "end")
@@ -1271,6 +1337,7 @@ class MainWindow(tk.Tk):
         self._pass_total = 0
         self._outer_remaining = 0
         self._pending.clear()
+        self._cancel_all_axis_retries()
         self.event_queue.clear()
         self.event_list.delete(0, "end")
         self.event_count_var.set("0 条")
@@ -1369,6 +1436,7 @@ class MainWindow(tk.Tk):
         self._auto_leg = "stopped"
         self._outer_remaining = 0
         self._pending.clear()
+        self._cancel_all_axis_retries()
         self._cancel_flash_pause()
         self.event_queue.clear()
         self.event_list.delete(0, "end")
@@ -1389,6 +1457,7 @@ class MainWindow(tk.Tk):
         self._auto_leg = "aborted"
         self._outer_remaining = 0
         self._pending.clear()
+        self._cancel_all_axis_retries()
         self._cancel_flash_pause()
         self.event_queue.clear()
         self.event_list.delete(0, "end")
@@ -1526,7 +1595,7 @@ class MainWindow(tk.Tk):
         self._append_log(
             f"[自动] 新层开始，Y 移动到初始位置 {fmt_pos(self._y_start)}\n")
         self.sender.send_command(f"Y={fmt_pos(self._y_start)}")
-        self._wait_target("Y", self._y_start)
+        self._wait_target("Y", self._y_start, retry_timeout_ms=Y_TIMEOUT_MS)
         self._auto_uv_update()
 
     def _begin_layer_motion(self):
@@ -1620,7 +1689,7 @@ class MainWindow(tk.Tk):
             f"[自动] PASS STEP={step} μm，四舍五入后 Y 相对移动 {sign}{distance} mm "
             f"-> {fmt_pos(y_target)}\n")
         self.sender.send_command(f"Y{sign}{distance}")
-        self._wait_target("Y", y_target)
+        self._wait_target("Y", y_target, retry_timeout_ms=Y_TIMEOUT_MS)
         self._auto_uv_update()
 
     def _finish_server_pass(self):
@@ -1785,7 +1854,7 @@ class MainWindow(tk.Tk):
             self._append_log(
                 f"[自动] prehome 完成，移动 Y 到起始位置 {fmt_pos(Y_HOME)}\n")
             self.sender.send_command(f"Y={fmt_pos(Y_HOME)}")
-            self._wait_target("Y", Y_HOME)
+            self._wait_target("Y", Y_HOME, retry_timeout_ms=Y_TIMEOUT_MS)
             return True
         if self._auto_leg == "prehome_yhome":
             # Y 到位后才开始等待本任务的 LAYER_START。
@@ -1914,7 +1983,7 @@ class MainWindow(tk.Tk):
             self._append_log(f"[自动] Y 步进 {sign}{fmt_pos(self._auto_ystep)} -> {fmt_pos(y_target)}\n")
             self.sender.send_command(
                 f"Y{sign}{fmt_pos(self._auto_ystep)}")
-            self._wait_target("Y", y_target)
+            self._wait_target("Y", y_target, retry_timeout_ms=Y_TIMEOUT_MS)
             return True
         # 本组内循环全部完成
         if self._outer_remaining > 1:
@@ -1929,7 +1998,7 @@ class MainWindow(tk.Tk):
                 f"[自动] 本组完成，Y 回到起始位置 {fmt_pos(self._y_start)}"
                 f"（大循环剩余 {self._outer_remaining}）\n")
             self.sender.send_command(f"Y={fmt_pos(self._y_start)}")
-            self._wait_target("Y", self._y_start)
+            self._wait_target("Y", self._y_start, retry_timeout_ms=Y_TIMEOUT_MS)
             return True
         # 全部完成
         self._auto_active = False
@@ -2012,6 +2081,7 @@ class MainWindow(tk.Tk):
         self._pass_current = 0
         self._pass_total = 0
         self._pending.clear()
+        self._cancel_all_axis_retries()
         self._cancel_flash_pause()
         self.event_queue.clear()
         self.event_list.delete(0, "end")
@@ -2061,6 +2131,7 @@ class MainWindow(tk.Tk):
             if not connected:
                 # 断开后清空等待目标并解锁，避免卡死
                 self._pending.clear()
+                self._cancel_all_axis_retries()
                 self._auto_active = False
                 self._auto_mode = None
                 self._outer_remaining = 0

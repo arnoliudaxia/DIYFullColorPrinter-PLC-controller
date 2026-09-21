@@ -13,7 +13,7 @@ max = 120.0
 
 [axis_limits.Z]
 min = -60.0
-max = 125.0
+max = 123.0
 
 # 自动循环 X 轴往返端点 (mm)
 # 同时用于 X 轴预设中的"起始位置"/"终点位置"按钮
@@ -26,11 +26,14 @@ x_end = 200.0
 x_end_withuv = 220.0
 # X 轴速度（1~100）：去程为起始位置到终点，来程为终点返回起始位置
 x_speed_outbound = 100
-x_speed_return = 100
+x_speed_return = 150
 # 自动 UV 灯开启的 X 轴水平偏移 (mm)
 uv_offset = 120.0
 # 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
 pass_stop_wait_seconds = 0.3
+# 自动流程中发送 Y 运动指令后的到位超时时间 (ms)。
+# 超时未到位会自动重新发送 Y 指令（0 表示关闭重发）。
+y_timeout_ms = 10000
 
 # 点动步长选项 (mm)，UI 中显示为单选按钮，默认选中第一个
 [jog]
