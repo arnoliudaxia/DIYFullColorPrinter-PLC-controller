@@ -18,6 +18,7 @@
 """
 
 import ctypes
+import json
 import os
 import queue
 import re
@@ -26,6 +27,7 @@ import threading
 import time
 import tkinter as tk
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tkinter import ttk, messagebox
 
 # ---------- 协议常量 ----------
@@ -156,14 +158,35 @@ def _load_y_timeout_ms(cfg: dict) -> int:
     return ms
 
 
+_DEFAULT_HTTP_HOST = "0.0.0.0"
+_DEFAULT_HTTP_PORT = 8080
+
+
+def _load_http_api(cfg: dict):
+    """HTTP 进度查询 API 的监听地址。GET /progress 返回打印/PASS 进度 JSON。"""
+    host, port = _DEFAULT_HTTP_HOST, _DEFAULT_HTTP_PORT
+    try:
+        section = cfg.get("http_api", {})
+        host = str(section.get("host", host))
+        port = int(section.get("port", port))
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except (AttributeError, TypeError, ValueError):
+        host, port = _DEFAULT_HTTP_HOST, _DEFAULT_HTTP_PORT
+    return host, port
+
+
 def _load_x_speeds(cfg: dict):
-    """Load X-axis outbound (home→end) and return (end→home) speeds."""
+    """Load X-axis outbound (home→end) and return (end→home) speeds.
+
+    只校验下限（>=1），上限交由设备自己约束，代码不做限制。
+    """
     outbound, return_speed = _DEFAULT_X_SPEED_OUTBOUND, _DEFAULT_X_SPEED_RETURN
     try:
         section = cfg.get("auto_cycle", {})
         outbound = int(section.get("x_speed_outbound", outbound))
         return_speed = int(section.get("x_speed_return", return_speed))
-        if not (1 <= outbound <= 100 and 1 <= return_speed <= 100):
+        if outbound < 1 or return_speed < 1:
             raise ValueError
     except (AttributeError, TypeError, ValueError):
         outbound, return_speed = _DEFAULT_X_SPEED_OUTBOUND, _DEFAULT_X_SPEED_RETURN
@@ -288,6 +311,16 @@ def _load_flash_wait_timeout(cfg: dict) -> int:
 
 _DEFAULT_PRESS_Z_PRESET = 70.0
 _DEFAULT_PRESS_INK_DURATIONS = (2.0, 5.0, 10.0)  # 压墨时长可选值 (s)
+_DEFAULT_PRINT_Z = 125.0  # Z 轴预设"打印高度" (mm)
+
+
+def _load_print_z(cfg: dict) -> float:
+    """Z 轴预设"打印高度"按钮位置 (mm)，来自 z_presets.print_z。"""
+    try:
+        value = float(cfg["z_presets"].get("print_z", _DEFAULT_PRINT_Z))
+        return value
+    except (KeyError, TypeError, ValueError):
+        return _DEFAULT_PRINT_Z
 
 
 def _load_press_ink(cfg: dict):
@@ -340,6 +373,7 @@ X_HOME, X_END, X_END_WITH_UV = _load_cycle_endpoints(_CONFIG)
 UV_OFFSET_DEFAULT = _load_uv_offset(_CONFIG)
 Y_HOME = _load_y_home(_CONFIG)
 Y_TIMEOUT_MS = _load_y_timeout_ms(_CONFIG)
+HTTP_API_HOST, HTTP_API_PORT = _load_http_api(_CONFIG)
 X_SPEED_OUTBOUND, X_SPEED_RETURN = _load_x_speeds(_CONFIG)
 X_ZERO = _load_x_zero(_CONFIG)
 PASS_STOP_WAIT_SECONDS = _load_pass_stop_wait_seconds(_CONFIG)
@@ -352,6 +386,7 @@ FLASH_X_OFFSET = _load_flash_x_offset(_CONFIG)
 FLASH_WAIT_TIMEOUT_MS = _load_flash_wait_timeout(_CONFIG)
 PRESS_INK_Z_PRESET = _load_press_ink(_CONFIG)
 PRESS_INK_DURATIONS = _load_press_ink_durations(_CONFIG)
+PRINT_Z = _load_print_z(_CONFIG)
 UI_SCALE, WIN_SIZE, COL_WIDTHS = _load_ui(_CONFIG)
 
 # 点动按钮文字: {轴: (负方向, 正方向)}，保留正负号
@@ -387,6 +422,31 @@ def fmt_duration(seconds: float) -> str:
     """秒数格式化为 HH:MM:SS"""
     s = int(round(seconds))
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def make_progress_handler(window):
+    """HTTP 进度查询处理器：GET /progress 返回打印/PASS 进度 JSON。"""
+    class ProgressHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path not in ("/", "/progress"):
+                self.send_error(404, "Not Found")
+                return
+            if path == "/":
+                payload = {"endpoints": ["/progress"]}
+            else:
+                payload = window.progress_snapshot()
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass  # 静默 HTTP 访问日志，避免刷屏
+
+    return ProgressHandler
 
 
 # ---------- TCP 收发器 ----------
@@ -680,6 +740,9 @@ class MainWindow(tk.Tk):
         # 启动后自动连接设备与扫描服务器
         self.after(300, self._auto_connect)
 
+        # 后台 HTTP 进度查询 API（不占 UI 线程）
+        self.after(100, self._start_http_api)
+
     def _auto_connect(self):
         if not self.sender.connected:
             self._toggle_connect()
@@ -775,7 +838,7 @@ class MainWindow(tk.Tk):
         quick_z = ttk.Frame(frame)
         quick_z.grid(row=6, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_z, text="Z 轴预设:").pack(side="left", padx=4)
-        for text, target in [("打印高度 (125)", 125),
+        for text, target in [(f"打印高度 ({fmt_pos(PRINT_Z)})", PRINT_Z),
                              ("调试高度 (-10)", -10),
                              (f"压墨高度 ({fmt_pos(PRESS_INK_Z_PRESET)})",
                               PRESS_INK_Z_PRESET)]:
@@ -1605,8 +1668,11 @@ class MainWindow(tk.Tk):
         self._begin_x_end_motion()
 
     def _set_x_speed(self, speed: int):
-        """Set PLC X-axis speed (1..100) before a PASS movement."""
-        speed = max(1, min(100, int(speed)))
+        """Set PLC X-axis speed before a PASS movement.
+
+        只保证下限 1，上限交由设备约束，代码不做限制。
+        """
+        speed = max(1, int(speed))
         self.sender.send_command(f"V={speed}")
         self._append_log(f"[自动] 设置 X 轴速度 V={speed}\n")
 
@@ -2152,7 +2218,42 @@ class MainWindow(tk.Tk):
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
 
+    # ---------- HTTP 进度查询 API ----------
+
+    def progress_snapshot(self) -> dict:
+        """HTTP API 返回的当前打印/PASS 进度快照（供后台线程读取）。"""
+        return {
+            "auto_active": bool(self._auto_active),
+            "mode": self._auto_mode,
+            "state": self._auto_leg,
+            "job_current_layer": self._job_current_layer,
+            "job_total_layers": self._job_total_layers,
+            "pass_current": self._pass_current,
+            "pass_total": self._pass_total,
+        }
+
+    def _start_http_api(self):
+        """在后台线程启动 HTTP 进度查询服务（失败不影响主程序）。"""
+        self._http_server = None
+        try:
+            server = ThreadingHTTPServer(
+                (HTTP_API_HOST, HTTP_API_PORT), make_progress_handler(self))
+        except OSError as e:
+            self._append_log(f"[HTTP] 进度 API 启动失败 {HTTP_API_HOST}:{HTTP_API_PORT}: {e}\n")
+            return
+        self._http_server = server
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self._append_log(
+            f"[HTTP] 进度 API 已启动: http://{HTTP_API_HOST}:{HTTP_API_PORT}/progress\n")
+
+    def _stop_http_api(self):
+        if getattr(self, "_http_server", None) is not None:
+            self._http_server.shutdown()
+            self._http_server.server_close()
+            self._http_server = None
+
     def _on_close(self):
+        self._stop_http_api()
         self.sender.disconnect()
         self.scan.disconnect()
         self.destroy()

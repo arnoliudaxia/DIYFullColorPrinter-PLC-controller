@@ -13,7 +13,7 @@ max = 120.0
 
 [axis_limits.Z]
 min = -60.0
-max = 123.0
+max = 124.0
 
 # 自动循环 X 轴往返端点 (mm)
 # 同时用于 X 轴预设中的"起始位置"/"终点位置"按钮
@@ -24,9 +24,10 @@ x_zero = 0.0
 y_home = 50.0
 x_end = 200.0
 x_end_withuv = 220.0
-# X 轴速度（1~100）：去程为起始位置到终点，来程为终点返回起始位置
+# X 轴速度：去程为起始位置到终点，来程为终点返回起始位置
+# 代码只要求 >= 1，上限由设备约束
 x_speed_outbound = 100
-x_speed_return = 150
+x_speed_return = 100
 # 自动 UV 灯开启的 X 轴水平偏移 (mm)
 uv_offset = 120.0
 # 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
@@ -34,6 +35,12 @@ pass_stop_wait_seconds = 0.3
 # 自动流程中发送 Y 运动指令后的到位超时时间 (ms)。
 # 超时未到位会自动重新发送 Y 指令（0 表示关闭重发）。
 y_timeout_ms = 10000
+
+# HTTP 进度查询 API：GET /progress 返回打印进度与 PASS 进度的 JSON
+# 修改后重新启动程序生效
+[http_api]
+host = "0.0.0.0"
+port = 8080
 
 # 点动步长选项 (mm)，UI 中显示为单选按钮，默认选中第一个
 [jog]
@@ -64,6 +71,11 @@ wait_timeout_ms = 5000
 z_drop = 80.0
 durations = [2, 5, 10]
 press_z = 70.0
+
+# Z 轴预设按钮高度 (mm)
+# print_z: "打印高度"预设按钮移动到的位置；应不超过 axis_limits.Z 的 max
+[z_presets]
+print_z = 123.0
 
 # UI：整体缩放系数、窗口宽高（按缩放系数放大）
 # 两列布局：左侧连接/服务/设备/日志，右侧轴控制，窗口加宽减高
