@@ -660,6 +660,9 @@ class MainWindow(tk.Tk):
         self.uv_on = False
         self.roller_on = False
         self.flash_on = False  # 闪喷状态，以服务器回送的 AFTER 为准
+        # 手动压墨循环：成功发送一次压墨命令后，在 2 倍压墨时长后再次发送
+        self._press_ink_repeat_enabled = False
+        self._press_ink_repeat_after = None
 
         # 运动中的等待目标 {轴: 目标位置}，某轴非空时只锁定该轴的控件
         self._pending = {}
@@ -948,6 +951,12 @@ class MainWindow(tk.Tk):
                            selectcolor="#2e86de",        # 选中时底色（蓝色突出）
                            activebackground="#9ec7f0",   # 悬停底色
                            font=("", 10, "bold")).pack(side="left", padx=2, pady=8)
+        self.press_ink_repeat_btn = tk.Button(
+            row1b, text="循环压墨: 关", width=12,
+            command=self._toggle_press_ink_repeat,
+            bg="#f0f0f0", activebackground="#d9d9d9",
+            font=("", 10, "bold"))
+        self.press_ink_repeat_btn.pack(side="left", padx=(10, 4), pady=8)
 
         row2 = ttk.Frame(frame)
         row2.pack(fill="x")
@@ -1019,6 +1028,10 @@ class MainWindow(tk.Tk):
             self.scan_btn.config(text="断开" if connected else "连接")
             self.scan_ready_var.set("等待就绪帧..." if connected else "未连接")
             self._append_log(f"[扫描] {msg}\n")
+            if not connected and (self._press_ink_repeat_enabled
+                                  or self._press_ink_repeat_after is not None):
+                self._set_press_ink_repeat(False)
+                self._append_log("[压墨] 扫描服务器已断开，循环压墨已关闭\n")
         self.after(0, update)
 
     def _on_scan_ready(self):
@@ -1038,7 +1051,6 @@ class MainWindow(tk.Tk):
     def _select_press_ink_time(self):
         """切换压墨时长预设按钮，更新当前时长"""
         self.press_ink_seconds = float(self.press_ink_time_var.get())
-        self.press_ink_time_label_var.set(f"(时长 {fmt_pos(self.press_ink_seconds)}s)")
 
     def _send_custom_cmd(self):
         """发送用户输入的自定义指令"""
@@ -1058,14 +1070,61 @@ class MainWindow(tk.Tk):
             self.sender.send_command(cmd)
             self._append_log(f"[自定义] 发送: {cmd}\r\n")
 
-    def _send_press_ink(self):
-        """手动发送压墨命令 PRESS_INK <秒数>\r\n 到扫描服务器"""
+    def _set_press_ink_repeat(self, enabled: bool):
+        """更新循环压墨状态；关闭时仅取消后续循环，不撤回已发送的命令。"""
+        self._press_ink_repeat_enabled = enabled
+        if not enabled and self._press_ink_repeat_after is not None:
+            self.after_cancel(self._press_ink_repeat_after)
+            self._press_ink_repeat_after = None
+        self.press_ink_repeat_btn.config(
+            text=f"循环压墨: {'开' if enabled else '关'}",
+            bg="#2e86de" if enabled else "#f0f0f0",
+            fg="white" if enabled else "black",
+            activebackground="#9ec7f0" if enabled else "#d9d9d9")
+
+    def _toggle_press_ink_repeat(self):
+        enabled = not self._press_ink_repeat_enabled
+        self._set_press_ink_repeat(enabled)
+        if enabled:
+            self._append_log("[压墨] 循环压墨已开启，点击压墨按钮后开始循环\n")
+        else:
+            self._append_log("[压墨] 循环压墨已关闭，不再发送后续压墨命令\n")
+
+    def _schedule_press_ink_repeat(self, seconds: float):
+        """从本次命令成功发送时计时，在 2 倍压墨时长后再次压墨。"""
+        if self._press_ink_repeat_after is not None:
+            self.after_cancel(self._press_ink_repeat_after)
+            self._press_ink_repeat_after = None
+        if not self._press_ink_repeat_enabled:
+            return
+        delay_seconds = 2 * seconds
+        self._press_ink_repeat_after = self.after(
+            int(round(delay_seconds * 1000)), self._repeat_press_ink)
+        self._append_log(
+            f"[压墨] 循环计时开始，{fmt_pos(delay_seconds)}s 后再次压墨\n")
+
+    def _repeat_press_ink(self):
+        self._press_ink_repeat_after = None
+        if self._press_ink_repeat_enabled:
+            self._send_press_ink(repeated=True)
+
+    def _send_press_ink(self, repeated=False):
+        """发送压墨命令；循环开启时，在成功发送后安排下一次压墨。"""
         if not self.scan.connected:
-            messagebox.showwarning("提示", "扫描服务器未连接")
+            if repeated:
+                self._set_press_ink_repeat(False)
+                self._append_log("[压墨] 扫描服务器未连接，循环压墨已关闭\n")
+            else:
+                messagebox.showwarning("提示", "扫描服务器未连接")
             return
         seconds = self.press_ink_seconds
         if self.scan.send(f"PRESS_INK {fmt_pos(seconds)}\r\n"):
-            self._append_log(f"[压墨] 发送: PRESS_INK {fmt_pos(seconds)}\r\n")
+            source = "循环" if repeated else "手动"
+            self._append_log(f"[压墨] {source}发送: PRESS_INK {fmt_pos(seconds)}\r\n")
+            self._schedule_press_ink_repeat(seconds)
+        elif repeated:
+            self._set_press_ink_repeat(False)
+            self._append_log("[压墨] 循环命令发送失败，循环压墨已关闭\n")
 
     def _on_scan_response(self, line: str):
         def update():
@@ -2149,6 +2208,7 @@ class MainWindow(tk.Tk):
         self._pending.clear()
         self._cancel_all_axis_retries()
         self._cancel_flash_pause()
+        self._set_press_ink_repeat(False)
         self.event_queue.clear()
         self.event_list.delete(0, "end")
         self.event_count_var.set("0 条")
@@ -2253,6 +2313,7 @@ class MainWindow(tk.Tk):
             self._http_server = None
 
     def _on_close(self):
+        self._set_press_ink_repeat(False)
         self._stop_http_api()
         self.sender.disconnect()
         self.scan.disconnect()
