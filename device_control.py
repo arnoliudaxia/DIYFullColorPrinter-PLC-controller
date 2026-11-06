@@ -673,6 +673,9 @@ class MainWindow(tk.Tk):
         self.auto_widgets = []
         # X 轴自动循环状态
         self._auto_active = False
+        # 暂停只阻止下一动作，不中断已经发出的运动或正在进行的等待。
+        self._workflow_paused = False
+        self._prehome_pending_start = False
         self._auto_mode = None       # 当前任务来源: "manual" / "server"
         self._auto_remaining = 0   # 本组内剩余循环次数
         self._inner_total = 0      # 每组内循环次数
@@ -879,6 +882,9 @@ class MainWindow(tk.Tk):
                   foreground="#7b1fa2").pack(side="left", padx=(12, 0))
         ttk.Button(head, text="停止", width=6,
                    command=self._emergency_stop).pack(side="right")
+        self.pause_btn = ttk.Button(
+            head, text="暂停", width=6, command=self._toggle_workflow_pause)
+        self.pause_btn.pack(side="right", padx=(0, 4))
 
         self.event_list = tk.Listbox(frame, height=8, font=("Consolas", 9),
                                      exportselection=False)
@@ -1404,6 +1410,70 @@ class MainWindow(tk.Tk):
         self.pass_progress_var.set(
             f"PASS进度: {self._pass_current}/{self._pass_total}")
 
+    def _defer_next_action(self) -> bool:
+        """暂停时保留当前流程段，等用户恢复后再推进下一动作。"""
+        if not self._workflow_paused:
+            return False
+        self.status_var.set("已暂停：下一动作等待恢复")
+        return True
+
+    def _reset_workflow_pause(self):
+        """停止、完成或断开时清除暂停状态。"""
+        self._workflow_paused = False
+        self.pause_btn.config(text="暂停")
+
+    def _toggle_workflow_pause(self):
+        if not self._workflow_paused:
+            self._workflow_paused = True
+            self.pause_btn.config(text="恢复")
+            self.status_var.set("已请求暂停：当前动作继续，下一动作等待恢复")
+            self._append_log("[暂停] 当前动作继续执行，下一动作将等待恢复\n")
+            return
+        self._workflow_paused = False
+        self.pause_btn.config(text="暂停")
+        self.status_var.set("已恢复，继续执行后续动作")
+        self._append_log("[暂停] 已恢复，继续执行后续动作\n")
+        self._resume_workflow()
+
+    def _resume_workflow(self):
+        """按保留的流程段恢复；尚未完成的当前动作不作重复推进。"""
+        if not self._auto_active or self._workflow_paused:
+            return
+        if (self._pending or self._flash_after is not None
+                or self._flash_wait_after is not None
+                or self._server_stop_after is not None):
+            return
+        leg = self._auto_leg
+        if leg == "prehome":
+            if self._prehome_pending_start:
+                self._start_prehome()
+            else:
+                self._auto_advance()
+        elif leg == "wait_layer":
+            self._try_start_layer()
+        elif leg == "wait_pass_ready":
+            self._try_start_pass()
+        elif leg == "wait_after_pass_stop":
+            self._resume_after_pass_stop()
+        elif leg == "server_flash_pause":
+            if self._flash_pausing:
+                self._flash_resume()
+            elif not self._flash_wait_off:
+                self._proceed_after_flash()
+        else:
+            self._auto_advance()
+
+    def _start_prehome(self):
+        """开始任务的 X 回起始位置动作；恢复暂停时也从这里继续。"""
+        if (not self._auto_active or self._auto_leg != "prehome"
+                or self._pending or self._defer_next_action()):
+            return
+        self._prehome_pending_start = False
+        self._append_log(f"[自动] 移动 X 到起始位置 {fmt_pos(X_HOME)}\n")
+        self.sender.send_command(f"X={fmt_pos(X_HOME)}")
+        self._wait_target("X", X_HOME)
+        self._auto_uv_update()
+
     def _start_job(self, total_layers: int):
         """服务器 START_JOB 事件：新的任务逻辑，不复用 _start_auto。
 
@@ -1440,10 +1510,8 @@ class MainWindow(tk.Tk):
         self._append_log(
             f"[自动] 使用配置的 Y 起始位置 {fmt_pos(self._y_start)}\n")
         self._auto_leg = "prehome"
-        self._append_log(f"[自动] 移动 X 到起始位置 {fmt_pos(X_HOME)}\n")
-        self.sender.send_command(f"X={fmt_pos(X_HOME)}")
-        self._wait_target("X", X_HOME)
-        self._auto_uv_update()
+        self._prehome_pending_start = True
+        self._start_prehome()
 
     def _complete_server_job(self):
         """收到服务端 PRINT_JOB_COMPLETED 后清理任务，并清空 Y 初始位置。"""
@@ -1464,6 +1532,7 @@ class MainWindow(tk.Tk):
         self.event_list.delete(0, "end")
         self.event_count_var.set("0 条")
         self._cancel_flash_pause()
+        self._reset_workflow_pause()
         self.event_queue.clear()
         self.event_list.delete(0, "end")
         self.event_count_var.set("0 条")
@@ -1545,10 +1614,8 @@ class MainWindow(tk.Tk):
         self._lock_auto_group()
         # 先回起始位置，避免当前 X 位置不确定
         self._auto_leg = "prehome"
-        self._append_log(f"[自动] 先回起始位置 {fmt_pos(X_HOME)}\n")
-        self.sender.send_command(f"X={fmt_pos(X_HOME)}")
-        self._wait_target("X", X_HOME)
-        self._auto_uv_update()
+        self._prehome_pending_start = True
+        self._start_prehome()
 
     def _stop_manual_auto(self):
         if not self._auto_active:
@@ -1560,6 +1627,7 @@ class MainWindow(tk.Tk):
         self._pending.clear()
         self._cancel_all_axis_retries()
         self._cancel_flash_pause()
+        self._reset_workflow_pause()
         self.event_queue.clear()
         self.event_list.delete(0, "end")
         self.event_count_var.set("0 条")
@@ -1581,6 +1649,7 @@ class MainWindow(tk.Tk):
         self._pending.clear()
         self._cancel_all_axis_retries()
         self._cancel_flash_pause()
+        self._reset_workflow_pause()
         self.event_queue.clear()
         self.event_list.delete(0, "end")
         self.event_count_var.set("0 条")
@@ -1627,9 +1696,9 @@ class MainWindow(tk.Tk):
     def _flash_resume(self):
         """闪喷暂停结束：若闪喷仍开启则先发送结束命令，确认关闭后再移动 X"""
         self._flash_after = None
-        self._flash_pausing = False
-        if not self._auto_active:
+        if not self._auto_active or self._defer_next_action():
             return
+        self._flash_pausing = False
         if self.flash_on:
             self._flash_wait_off = True
             self._append_log("[自动] 发送结束闪喷命令\n")
@@ -1641,7 +1710,7 @@ class MainWindow(tk.Tk):
 
     def _proceed_after_flash(self):
         """结束闪喷确认后，按手动/服务端任务类型继续对应流程。"""
-        if not self._auto_active:
+        if not self._auto_active or self._defer_next_action():
             return
         if (self._auto_mode == "server"
                 and self._auto_leg == "server_flash_pause"):
@@ -1751,6 +1820,8 @@ class MainWindow(tk.Tk):
         """wait_pass_ready 时消费一条合法 PASS_READY，并执行当前 PASS 的 X 运动。"""
         if not (self._auto_active and self._auto_mode == "server"
                 and self._auto_leg == "wait_pass_ready"):
+            return
+        if self._defer_next_action():
             return
         event = received_event
         if event is None:
@@ -1916,6 +1987,8 @@ class MainWindow(tk.Tk):
         if not (self._auto_active and self._auto_mode == "server"
                 and self._auto_leg == "wait_after_pass_stop"):
             return
+        if self._defer_next_action():
+            return
         self._append_log(
             f"[自动] PASS 终点后等待 {fmt_pos(PASS_STOP_WAIT_SECONDS)} 秒完成，"
             "继续 PASS 流程\n")
@@ -1928,6 +2001,8 @@ class MainWindow(tk.Tk):
         wait_layer，待 LAYER_START 处理器入队后传入对应层号再次触发。
         """
         if not (self._auto_active and self._auto_leg == "wait_layer"):
+            return
+        if self._defer_next_action():
             return
         max_layer = self._job_total_layers if self._auto_mode == "server" else 1
         layer = received_layer
@@ -1969,6 +2044,8 @@ class MainWindow(tk.Tk):
 
     def _auto_advance(self) -> bool:
         """一段到达后推进自动循环，返回 True 表示已发出下一段"""
+        if self._defer_next_action():
+            return False
         if self._auto_leg == "prehome":
             # X 回到 HOME 后，再将 Y 移动到配置的 prehome 起始位置。
             if not (AXIS_LIMITS["Y"][0] <= Y_HOME <= AXIS_LIMITS["Y"][1]):
@@ -2208,6 +2285,7 @@ class MainWindow(tk.Tk):
         self._pending.clear()
         self._cancel_all_axis_retries()
         self._cancel_flash_pause()
+        self._reset_workflow_pause()
         self._set_press_ink_repeat(False)
         self.event_queue.clear()
         self.event_list.delete(0, "end")
@@ -2262,6 +2340,7 @@ class MainWindow(tk.Tk):
                 self._auto_mode = None
                 self._outer_remaining = 0
                 self._cancel_flash_pause()
+                self._reset_workflow_pause()
                 self.cycle_info_var.set("")
                 self.eta_var.set("")
                 self._unlock_all()
@@ -2284,6 +2363,7 @@ class MainWindow(tk.Tk):
         """HTTP API 返回的当前打印/PASS 进度快照（供后台线程读取）。"""
         return {
             "auto_active": bool(self._auto_active),
+            "paused": bool(self._workflow_paused),
             "mode": self._auto_mode,
             "state": self._auto_leg,
             "job_current_layer": self._job_current_layer,
