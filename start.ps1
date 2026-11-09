@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 # PLC 设备远程控制程序启动脚本 (PowerShell)
 # 使用 uv 运行，自动处理虚拟环境
 
@@ -37,15 +37,22 @@ Write-Host "[信息] uv 版本: " -NoNewline -ForegroundColor Gray
 & uv --version
 Write-Host ""
 
-# 运行程序
+# 运行程序，立即保存退出码，正常结束时不再等待按键。
+$exitCode = 1
 Push-Location $PSScriptRoot
 try {
     & uv run python device_control.py
+    $exitCode = $LASTEXITCODE
 }
 finally {
     Pop-Location
 }
 
 Write-Host ""
+if ($exitCode -ne 0) {
+    Write-Host "[错误] 程序异常退出，退出码: $exitCode" -ForegroundColor Red
+    Read-Host "按 Enter 键关闭窗口"
+    exit $exitCode
+}
 Write-Host "[信息] 程序已退出。" -ForegroundColor Yellow
-Read-Host "按 Enter 键关闭窗口"
+exit 0

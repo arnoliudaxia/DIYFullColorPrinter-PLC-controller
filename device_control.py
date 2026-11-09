@@ -10,7 +10,7 @@
  行程范围: X [-38, 232]  Y [-7, 123]  Z [-65, 119.5]
  多条指令间隔 >= 50ms（程序内置发送队列自动保证）
 
-附加：扫描服务器连接（127.0.0.1:19090），仅建连并显示状态。
+附加：扫描服务器双向连接（主动 127.0.0.1:19090 / 反向监听 127.0.0.1:19091），共用单个命令/事件通道。
   连接成功后服务器发送: NETSCAN_SERVER_READY
   闪喷命令 FLASH，回复单行: OK FLASH BEFORE=OFF AFTER=ON（回送修改前/后的闪喷状态）
   压墨命令 PRESS_INK <秒数>，完成回送: OK PRESS_INK SECONDS=.. RESULT=COMPLETED STATE=OFF
@@ -40,6 +40,8 @@ POS_TOLERANCE = 0.1  # 判定到达目标位置的容差
 # 扫描服务器连接
 SCAN_HOST = "127.0.0.1"
 SCAN_PORT = 19090
+SCAN_LISTENER_HOST = "127.0.0.1"
+SCAN_LISTENER_PORT = 19091
 SCAN_READY = "NETSCAN_SERVER_READY"  # 连接成功后服务器发送的就绪帧
 CMD_FLASH = "FLASH"                  # 闪喷命令
 FLASH_ACCEPTED = "OK FLASH_ACCEPTED" # 旧版闪喷接受回复（兼容）
@@ -368,6 +370,8 @@ def _load_ui(cfg: dict):
 _CONFIG = _load_config()
 DEVICE_HOST, DEVICE_PORT = _load_server_endpoint(_CONFIG, "PLC_server", DEFAULT_HOST, DEFAULT_PORT)
 SCAN_SERVER_HOST, SCAN_SERVER_PORT = _load_server_endpoint(_CONFIG, "printer_server", SCAN_HOST, SCAN_PORT)
+SCAN_LISTEN_HOST, SCAN_LISTEN_PORT = _load_server_endpoint(
+    _CONFIG, "printer_listener", SCAN_LISTENER_HOST, SCAN_LISTENER_PORT)
 AXIS_LIMITS = _load_axis_limits(_CONFIG)
 X_HOME, X_END, X_END_WITH_UV = _load_cycle_endpoints(_CONFIG)
 UV_OFFSET_DEFAULT = _load_uv_offset(_CONFIG)
@@ -566,7 +570,7 @@ class TcpSender:
 # ---------- 扫描服务器连接 ----------
 
 class ScanClient:
-    """与扫描服务器建连（127.0.0.1:19090），显示连接/就绪状态并收发命令"""
+    """主动/被动连接共用一个命令和事件通道，先接管成功的 socket 胜出。"""
 
     def __init__(self, on_state_change, on_ready, on_response):
         self.sock = None
@@ -575,74 +579,213 @@ class ScanClient:
         self.on_state_change = on_state_change  # func(bool, str)
         self.on_ready = on_ready                # func() 收到就绪帧
         self.on_response = on_response          # func(str) 收到一行回复
+        self._lock = threading.Lock()
+        self._connecting = None                 # 尚未接管的主动连接
+        self._listener = None
+        self._listener_thread = None
+        self._accepting = True                  # 手动断开时暂停接管反向连接
+        self._closed = False
 
-    def connect(self, host: str, port: int) -> bool:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3)
-            sock.connect((host, port))
-            sock.settimeout(0.5)
-            self.sock = sock
-            self.connected = True
-            self.on_state_change(True, f"扫描服务器已连接 {host}:{port}")
-            threading.Thread(target=self._recv_loop, daemon=True).start()
-            return True
-        except Exception as e:
-            self.on_state_change(False, f"扫描服务器连接失败: {e}")
-            return False
-
-    def disconnect(self):
-        self.connected = False
-        self.ready = False
-        sock, self.sock = self.sock, None
-        if sock:
+    @staticmethod
+    def _close_socket(sock):
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 sock.close()
             except OSError:
                 pass
-        self.on_state_change(False, "扫描服务器已断开")
 
-    def send(self, data: str):
-        """发送原始命令（调用方自行带 \r\n）"""
-        sock = self.sock
-        if sock is None or not self.connected:
-            self.on_state_change(False, "扫描服务器未连接，命令未发送")
-            return False
-        try:
-            sock.sendall(data.encode("ascii"))
-            return True
-        except OSError as e:
-            self.on_state_change(False, f"扫描服务器发送失败: {e}")
-            self.disconnect()
-            return False
-
-    def _recv_loop(self):
-        buffer = ""
-        while True:
-            sock = self.sock
-            if sock is None or not self.connected:
-                return
+    def start_listener(self, host: str, port: int) -> bool:
+        """启动反向连接监听；绑定失败抛出 OSError，不影响现有连接。"""
+        with self._lock:
+            if self._closed:
+                return False
+            if self._listener is not None:
+                return True
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                data = sock.recv(4096)
-                if not data:
-                    self.disconnect()
+                listener.bind((host, port))
+                listener.listen(4)
+                listener.settimeout(0.2)
+            except OSError:
+                self._close_socket(listener)
+                raise
+            self._listener = listener
+            self._listener_thread = threading.Thread(
+                target=self._accept_loop, args=(listener,), daemon=True)
+            self._listener_thread.start()
+        return True
+
+    def _accept_loop(self, listener):
+        while True:
+            with self._lock:
+                if self._listener is not listener:
                     return
-                buffer += data.decode("ascii", errors="replace")
-                if not self.ready and SCAN_READY in buffer:
-                    self.ready = True
-                    self.on_ready()
-                # 按行分割，逐行回调
-                while "\r\n" in buffer or "\n" in buffer:
-                    line, _, rest = buffer.partition("\n")
-                    buffer = rest
-                    line = line.rstrip("\r")
-                    if line.strip():
-                        self.on_response(line)
+            try:
+                sock, address = listener.accept()
             except socket.timeout:
                 continue
             except OSError:
-                self.disconnect()
                 return
+            self._adopt_socket(sock, f"反向连接 {address[0]}:{address[1]}",
+                              listener=listener)
+
+    def connect(self, host: str, port: int) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            # 用户点击“连接”恢复反向接管；主动尝试失败也保持监听可用。
+            self._accepting = True
+            if self.sock is not None:
+                return True  # 已有连接时连临时 socket 都不创建
+            if self._connecting is not None:
+                return False
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._connecting = sock
+        try:
+            sock.settimeout(3)
+            sock.connect((host, port))
+        except OSError as e:
+            with self._lock:
+                owned = self._connecting is sock
+                if owned:
+                    self._connecting = None
+                self._close_socket(sock)
+            # incoming 胜出或已关闭时，不能发出误导的断开回调。
+            if owned:
+                self.on_state_change(False, f"扫描服务器连接失败: {e}")
+            return False
+        return self._adopt_socket(sock, f"已连接 {host}:{port}")
+
+    def _adopt_socket(self, sock, description, listener=None):
+        with self._lock:
+            valid = (self._connecting is sock if listener is None
+                     else self._listener is listener and self._accepting)
+            if self._closed or self.sock is not None or not valid:
+                self._close_socket(sock)
+                return False
+            pending, self._connecting = self._connecting, None
+            if pending is not sock:
+                self._close_socket(pending)
+            self.sock = sock
+            self.connected = True
+            self.ready = False
+            try:
+                sock.settimeout(0.5)
+                # 安装后主动发 HELLO，不等待 READY；锁保证它是首个发送帧。
+                sock.sendall(b"HELLO PLC\r\n")
+            except OSError:
+                self.sock = None
+                self.connected = False
+                self._close_socket(sock)
+                return False
+        # 不持锁调用 UI 回调：Tk.after 可能等待主线程。
+        self.on_state_change(True, f"扫描服务器{description}")
+        threading.Thread(target=self._recv_loop, args=(sock,), daemon=True).start()
+        return True
+
+    def stop_listener(self):
+        with self._lock:
+            listener, self._listener = self._listener, None
+            self._close_socket(listener)
+
+    def disconnect(self):
+        """手动断开并暂停反向接管，直到 connect() 恢复；recv 失败不走此处。"""
+        with self._lock:
+            self._accepting = False
+            pending, self._connecting = self._connecting, None
+            self._close_socket(pending)
+            sock = self.sock
+        if sock is not None:
+            self._disconnect_socket(sock)
+
+    def close(self):
+        """退出时关闭监听、连接和仍在尝试的主动连接；不可重新启动。"""
+        with self._lock:
+            self._closed = True
+        self.stop_listener()
+        self.disconnect()
+
+    def _disconnect_socket(self, sock, message="扫描服务器已断开"):
+        with self._lock:
+            # 旧 recv/send 线程只可清理自己的连接，不能碰新连接。
+            if self.sock is not sock:
+                return
+            self.sock = None
+            self.connected = False
+            self.ready = False
+            self._close_socket(sock)
+        self.on_state_change(False, message)
+
+    def send(self, data: str):
+        """发送原始命令（调用方自行带 \r\n）。"""
+        with self._lock:
+            sock = self.sock
+        if sock is None:
+            self.on_state_change(False, "扫描服务器未连接，命令未发送")
+            return False
+        return self._send_on_socket(sock, data)
+
+    def _send_on_socket(self, sock, data):
+        try:
+            with self._lock:
+                if self.sock is not sock:
+                    return False
+                # 与 UI 命令串行发送，PING 回包不可串到新连接上。
+                sock.sendall(data.encode("ascii"))
+            return True
+        except OSError as e:
+            self._disconnect_socket(sock, f"扫描服务器发送失败: {e}")
+            return False
+
+    def _recv_loop(self, sock):
+        buffer = ""
+        try:
+            while True:
+                with self._lock:
+                    if self.sock is not sock:
+                        return
+                try:
+                    data = sock.recv(4096)
+                except socket.timeout:
+                    continue
+                if not data:
+                    return
+                buffer += data.decode("ascii", errors="replace")
+                # 完整行才派发；半行留在此连接自己的 buffer 中。
+                while "\n" in buffer:
+                    line, _, buffer = buffer.partition("\n")
+                    line = line.rstrip("\r")
+                    with self._lock:
+                        if self.sock is not sock:
+                            return
+                    if line == "OK HELLO PLC":
+                        continue
+                    if line == "PING" or line.startswith("PING "):
+                        ping = re.fullmatch(r"PING TOKEN=([0-9]+)", line)
+                        if ping and any(c != "0" for c in ping[1]):
+                            if not self._send_on_socket(sock, f"PONG TOKEN={ping[1]}\r\n"):
+                                return
+                        continue  # 包括非法 PING，都不进入任务事件
+                    if line == "PONG" or line.startswith("PONG "):
+                        continue
+                    if line == SCAN_READY:
+                        with self._lock:
+                            if self.sock is not sock:
+                                return
+                            notify = not self.ready
+                            self.ready = True
+                        if notify:
+                            self.on_ready()
+                    if line.strip():
+                        self.on_response(line)
+        except OSError:
+            pass
+        finally:
+            self._disconnect_socket(sock)
 
 
 # ---------- 主窗口 ----------
@@ -742,6 +885,13 @@ class MainWindow(tk.Tk):
         self._build_status_bar()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # UI 和回调目标就绪后启动监听；主动连接仍按原方式保留。
+        try:
+            self.scan.start_listener(SCAN_LISTEN_HOST, SCAN_LISTEN_PORT)
+        except OSError as e:
+            self._append_log(
+                f"[扫描] 反向监听启动失败 {SCAN_LISTEN_HOST}:{SCAN_LISTEN_PORT}: {e}\n")
 
         # 启动后自动连接设备与扫描服务器
         self.after(300, self._auto_connect)
@@ -1031,10 +1181,14 @@ class MainWindow(tk.Tk):
 
     def _on_scan_state(self, connected: bool, msg: str):
         def update():
-            self.scan_btn.config(text="断开" if connected else "连接")
-            self.scan_ready_var.set("等待就绪帧..." if connected else "未连接")
+            # 回调排入Tk队列后连接可能已切换，UI以当前通道状态为准。
+            current_connected = self.scan.connected
+            self.scan_btn.config(text="断开" if current_connected else "连接")
+            self.scan_ready_var.set(
+                "就绪 (NETSCAN_SERVER_READY)" if current_connected and self.scan.ready
+                else "等待就绪帧..." if current_connected else "未连接")
             self._append_log(f"[扫描] {msg}\n")
-            if not connected and (self._press_ink_repeat_enabled
+            if not current_connected and (self._press_ink_repeat_enabled
                                   or self._press_ink_repeat_after is not None):
                 self._set_press_ink_repeat(False)
                 self._append_log("[压墨] 扫描服务器已断开，循环压墨已关闭\n")
@@ -1042,6 +1196,8 @@ class MainWindow(tk.Tk):
 
     def _on_scan_ready(self):
         def update():
+            if not self.scan.connected or not self.scan.ready:
+                return  # 忽略已断开的旧通道延迟到达的UI回调。
             self.scan_ready_var.set("就绪 (NETSCAN_SERVER_READY)")
             self._append_log("[扫描] 收到就绪帧: NETSCAN_SERVER_READY\n")
         self.after(0, update)
@@ -2396,7 +2552,7 @@ class MainWindow(tk.Tk):
         self._set_press_ink_repeat(False)
         self._stop_http_api()
         self.sender.disconnect()
-        self.scan.disconnect()
+        self.scan.close()
         self.destroy()
 
 

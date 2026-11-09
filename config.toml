@@ -90,6 +90,11 @@ port = 2001
 host = "127.0.0.1"
 port = 19090
 
+# Python 反向连接监听，与 printer_server 独立；MFC 当前固定连接 127.0.0.1:19091
+[printer_listener]
+host = "127.0.0.1"
+port = 19091
+
 [ui]
 scale = 1.6
 window_size = [800, 520]

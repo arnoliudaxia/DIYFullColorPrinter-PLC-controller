@@ -2,6 +2,9 @@
 .venv/
 venv/
 
+# 隐藏启动的本地日志
+/launcher.log
+
 # Python 缓存
 __pycache__/
 *.py[cod]

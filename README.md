@@ -5,6 +5,13 @@ Tkinter 桌面程序，通过 TCP 协议接收服务器事件并控制 PLC 完�
 - 主程序：`device_control.py`
 - 配置文件：`config.toml`（修改后重启生效，缺失或格式错误时使用内置默认值）
 
+## 启动方式
+
+- **日常使用，不显示控制台**：双击 `start-hidden.vbs`，仍由 `start.bat` 使用 uv 启动 GUI。关闭 GUI 后隐藏的启动进程自动结束。启动及控制台输出写入同目录的 `launcher.log`（每次启动覆盖）；非零退出码会弹窗提示查看日志。
+- **查看控制台日志**：双击 `start.bat`，或使用 `start.ps1`。正常关闭 GUI 后不再等待按键，双击打开的控制台随启动脚本结束；异常退出时仍保留窗口等待确认，方便查看错误。
+- 若从已有终端中运行脚本，脚本结束后会返回该终端，不会关闭你原本打开的终端。
+- 如系统策略禁用了 Windows Script Host / VBScript，请使用 `start.bat`；隐藏启动不改变设备、通信或运动逻辑。
+
 ## 连接
 
 连接地址和端口统一在 `config.toml` 配置，UI 仅提供“连接/断开”按钮。修改后需重启程序生效：
@@ -17,10 +24,32 @@ port = 2001
 [printer_server]
 host = "127.0.0.1"
 port = 19090
+
+[printer_listener]
+host = "127.0.0.1"
+port = 19091
 ```
 
 - **`PLC_server`**：PLC/设备控制服务器连接，负责三轴运动控制以及设备状态上报。
-- **`printer_server`**：打印扫描服务器连接，负责打印流程事件，以及闪喷（`FLASH`）、压墨（`PRESS_INK`）等打印维护指令。
+- **`printer_server`**：Python 主动连接的 MFC 打印扫描服务器，负责打印流程事件，以及闪喷（`FLASH`）、压墨（`PRESS_INK`）等打印维护指令。
+- **`printer_listener`**：Python 启动时自动监听的独立地址，接受 MFC 的反向连接。**MFC 当前固定连接 `127.0.0.1:19091`**，因此应保持此默认配置；单独修改 Python 端口不会同步修改 MFC。
+
+### 打印服务双向连接与握手
+
+Python 启动后同时保留原有主动连接 `19090` 的行为和 UI“连接/断开”按钮，并监听 `19091`。MFC 在没有已完成 HELLO 的 Python 连接时，每秒尝试一次反向连接，因此两个程序的启动顺序不限。两种连接共用同一个 `ScanClient` 命令/事件通道，任一时刻只保留一个活跃 socket：先成功安装的连接胜出，重复 incoming 直接关闭且不触发现有连接的断开回调；已有连接时主动连接不会再创建 socket。被动连接胜出时，尚在尝试的主动连接也会关闭。
+
+协议均使用 ASCII 行，以 `\r\n` 结束：
+
+1. MFC 把任一方向的连接加入通道时先发送 `NETSCAN_SERVER_READY\r\n`。
+2. Python 安装连接后立即主动发送 `HELLO PLC\r\n`，**不等待 READY**。
+3. MFC 收到 HELLO 后回复 `OK HELLO PLC\r\n`；初始 READY 已足够，不要求也不依赖再次发送 READY。
+4. MFC 仅在启动任务时发送 `PING TOKEN=<正整数>\r\n`（token 递增，MFC 等待回包超时为 3 秒）。Python 在接收线程中通过原 socket 直接回复 `PONG TOKEN=<原token>\r\n`，不经过 UI/任务事件队列，也保留 token 的原始数字文本。
+
+`OK HELLO PLC`、`PING`、`PONG` 是内部握手/心跳帧，不会作为任务事件派发；PING 不会触发任何运动。原有 `EVENT ...` 和命令回复沿用原回调，接收缓冲保留半行，完整分行后才派发。旧连接的接收线程只能关闭自己的 socket，不能影响重连后的新连接。
+
+UI“断开”会断开当前打印通道、取消尚在尝试的主动连接，并**暂停接管反向连接**：监听 socket 保留，但 MFC 后台重试的 incoming 会被立即关闭，不发送 HELLO、不安装连接，也不额外触发断开回调，因此不会立刻自动连回。点击“连接”会恢复反向接管并尝试主动连接；即使本次主动连接失败，反向监听仍然可用。启动时默认允许反向连接；网络断开或接收失败不会暂停接管，MFC 可自动重连。这些变化仅影响连接管理，不改变运动状态机。
+
+退出窗口时会关闭监听、当前连接及尚在尝试的主动连接。若监听端口被占用，日志会显示反向监听启动失败，原有主动连接仍可使用。
 
 X 轴速度在 `config.toml` 的 `[auto_cycle]` 中配置，取值为 1~100 的正整数：`x_speed_outbound`（去程，起始位置→终点，默认 60）和 `x_speed_return`（来程，终点→起始位置，默认 90）。每个 PASS 开始去程或返回时，程序会先向 PLC 发送对应的 `V=速度` 指令。
 
@@ -182,6 +211,17 @@ flowchart TD
 - 自动 UV 关闭时，PASS 使用 `x_end`，X 到达终点即完成，不发送 `q` 急停。
 - 自动 UV 开启时，PASS 使用 `x_end_withuv`；X ≥ `[auto_cycle] uv_offset` 时开灯，X 到达终点后关灯并完成 PASS，不等待 `PASS_REMAINING_ZERO`。其余运动段一律关灯。
 - 停止/中止/急停/断开时自动关灯。
+
+## 无硬件测试
+
+在仓库目录运行（Python 3.13+）：
+
+```powershell
+python -m unittest discover -s tests -v
+python -m py_compile device_control.py tests/test_scan_client.py
+```
+
+测试通过 AST 仅提取 `ScanClient`，不会导入或启动 `MainWindow`、PLC 控制逻辑、HTTP API，也不会连接真实设备或固定服务端口。网络测试仅使用本机随机空闲端口及模拟 socket，覆盖主动/被动连接、握手、PING 回包、EVENT 分行/半包保留、连接竞争、旧线程归属、关闭监听，以及手动断开暂停反向接管、点击连接恢复、主动失败保留监听和接收失败自动重连。
 
 ## 其他功能
 

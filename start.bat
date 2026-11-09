@@ -1,4 +1,5 @@
 @echo off
+setlocal
 chcp 65001 >nul
 REM PLC Device Remote Control Launcher
 REM Uses uv to run, auto-handles virtual environment
@@ -32,12 +33,12 @@ if exist "%LOCALAPPDATA%\Programs\uv\uv.exe" (
 echo [ERROR] uv not found. Please install uv first:
 echo   https://docs.astral.sh/uv/getting-started/installation/
 echo.
-pause
+if /i not "%~1"=="--hidden" pause
 exit /b 1
 
 :found_uv
 echo [INFO] uv found: %UV_CMD%
-%UV_CMD% --version
+"%UV_CMD%" --version
 echo.
 
 REM --- verify device_control.py ---
@@ -45,7 +46,7 @@ if not exist "%~dp0device_control.py" (
     echo [ERROR] device_control.py not found in current directory.
     echo   Please run this script from the same folder as device_control.py
     echo.
-    pause
+    if /i not "%~1"=="--hidden" pause
     exit /b 1
 )
 
@@ -54,8 +55,14 @@ echo.
 
 REM --- run ---
 cd /d "%~dp0"
-%UV_CMD% run python device_control.py
+"%UV_CMD%" run python device_control.py
+set "EXIT_CODE=%ERRORLEVEL%"
 
 echo.
+if not "%EXIT_CODE%"=="0" (
+    echo [ERROR] Program exited with code %EXIT_CODE%.
+    if /i not "%~1"=="--hidden" pause
+    exit /b %EXIT_CODE%
+)
 echo [INFO] Program exited.
-pause
+exit /b 0
