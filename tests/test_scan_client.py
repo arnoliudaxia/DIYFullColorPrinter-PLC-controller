@@ -133,6 +133,83 @@ class ScanClientTests(unittest.TestCase):
         self.assertFalse(self.client.ready)
         self.assertEqual(self.ready_calls, [])
 
+    def test_can_start_job_gate_suppresses_ping_without_tk_or_new_commands(self):
+        peer = self.outgoing()
+        gate = threading.Event()
+        gate.set()
+        calls = []
+        self.client.can_start_job = lambda: calls.append(threading.get_ident()) or not gate.is_set()
+        peer.sendall(b"PING TOKEN=31\r\nEVENT START_JOB TOTAL_LAYERS=1\r\n")
+        self.assertEqual(self.responses.get(timeout=2), "EVENT START_JOB TOTAL_LAYERS=1")
+        peer.settimeout(0.05)
+        with self.assertRaises(socket.timeout):
+            peer.recv(1)
+        self.assertTrue(calls)
+        self.assertNotIn(threading.get_ident(), calls)
+        gate.clear()
+        peer.settimeout(2)
+        peer.sendall(b"PING TOKEN=32\r\n")
+        self.assertEqual(read_line(peer), b"PONG TOKEN=32\r\n")
+        self.assert_no_response()
+
+    def test_channel_boundaries_are_queued_before_recv_and_after_complete_events(self):
+        sock = mock.Mock()
+        sock.recv.side_effect = [b"EVENT PRINT_JOB_COMPLETED TOTAL_LAYERS=1\r\n", b""]
+        events = []
+        self.client.on_channel_state = lambda connected, msg, channel: events.append(
+            ("state", connected, channel))
+        self.client.on_channel_response = lambda line, channel: events.append(("line", line, channel))
+
+        def invalidated(channel):
+            # hook 必须先于 sock=None，并且只针对活跃 socket。
+            self.assertIs(self.client.sock, channel)
+            events.append(("invalidated", channel))
+
+        self.client.on_channel_invalidated = invalidated
+        thread = mock.Mock()
+        thread.start.side_effect = lambda: self.assertEqual(events, [("state", True, sock)])
+        with mock.patch.dict(NAMESPACE, socket=socket_proxy(mock.Mock(return_value=sock))):
+            with mock.patch.object(threading, "Thread", return_value=thread):
+                self.assertTrue(self.client.connect("127.0.0.1", 1))
+        self.client._recv_loop(sock)
+        self.assertEqual(events, [("state", True, sock),
+            ("line", "EVENT PRINT_JOB_COMPLETED TOTAL_LAYERS=1", sock),
+            ("invalidated", sock), ("state", False, sock)])
+        self.assertEqual(self.states, [])  # 可选三参回调替代原两参回调，不重复派发。
+        self.client._disconnect_socket(sock)
+        self.assertEqual(len(events), 4)
+
+    def test_channel_delivery_and_disconnect_are_serialized(self):
+        sock = mock.Mock()
+        sock.recv.side_effect = [b"EVENT PRINT_JOB_COMPLETED TOTAL_LAYERS=1\r\n", b""]
+        self.client.sock, self.client.connected = sock, True
+        entered, release = threading.Event(), threading.Event()
+        events = []
+
+        def response(line, channel):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("response release timeout")
+            events.append("line")
+
+        self.client.on_channel_response = response
+        self.client.on_channel_state = lambda *args: events.append("disconnected")
+        receiver = threading.Thread(target=self.client._recv_loop, args=(sock,))
+        disconnect = threading.Thread(target=self.client._disconnect_socket, args=(sock,))
+        receiver.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            disconnect.start()
+            self.assertEqual(events, [])
+        finally:
+            release.set()
+            receiver.join(2)
+            if disconnect.ident is not None:
+                disconnect.join(2)
+        self.assertFalse(receiver.is_alive())
+        self.assertFalse(disconnect.is_alive())
+        self.assertEqual(events, ["line", "disconnected"])
+
     def test_outgoing_ping_and_event_fragmentation_preserves_lines(self):
         peer = self.outgoing()
         first = "EVENT START_JOB TOTAL_LAYERS=3"
@@ -466,7 +543,7 @@ class ScanCallbackTests(unittest.TestCase):
             scan_btn=mock.Mock(), scan_ready_var=mock.Mock(),
             _append_log=mock.Mock(), _set_press_ink_repeat=mock.Mock(),
             _press_ink_repeat_enabled=True, _press_ink_repeat_after=None,
-            after=lambda delay, callback: callback())
+            _post_ui=lambda callback, *args: callback(*args))
 
     def test_old_disconnect_callback_keeps_current_connection_ready(self):
         window = self.window(True, True)

@@ -30,6 +30,8 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tkinter import ttk, messagebox
 
+from encoder_reset import EncoderResetWorkflow
+
 # ---------- 协议常量 ----------
 
 DEFAULT_HOST = "192.168.1.88"
@@ -463,10 +465,11 @@ class TcpSender:
         self.connected = False
         self._queue = queue.Queue()
         self._worker = None
+        self._outstanding = 0
         self._lock = threading.Lock()
         self.on_sent = on_sent                  # func(str) 指令已发出
         self.on_state_change = on_state_change  # func(bool, str)
-        self.on_receive = on_receive            # func(str) 收到设备数据
+        self.on_receive = on_receive            # func(str, socket, monotonic) 收到设备数据
 
     def connect(self, host: str, port: int) -> bool:
         try:
@@ -477,17 +480,20 @@ class TcpSender:
             with self._lock:
                 self.sock = sock
                 self.connected = True
-            self._worker = threading.Thread(target=self._send_loop, daemon=True)
-            self._worker.start()
-            threading.Thread(target=self._recv_loop, daemon=True).start()
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._send_loop, daemon=True)
+                self._worker.start()
+            threading.Thread(target=self._recv_loop, args=(sock,), daemon=True).start()
             self.on_state_change(True, f"已连接 {host}:{port}")
             return True
         except Exception as e:
             self.on_state_change(False, f"连接失败: {e}")
             return False
 
-    def disconnect(self):
+    def disconnect(self, expected_sock=None):
         with self._lock:
+            if expected_sock is not None and self.sock is not expected_sock:
+                return
             self.connected = False
             sock, self.sock = self.sock, None
         if sock:
@@ -497,73 +503,135 @@ class TcpSender:
                 pass
         self.on_state_change(False, "已断开连接")
 
-    def send_command(self, cmd: str):
-        """指令入队，由发送线程按间隔发出"""
-        self._queue.put(cmd)
+    @property
+    def idle(self):
+        with self._lock:
+            return self._outstanding == 0
+
+    def send_command(self, cmd: str, safety=None, on_sent=None, sent_event=None):
+        """入队不是到位确认；维护命令额外绑定取消标记、socket 和发送回调。"""
+        with self._lock:
+            if safety is not None and (not self.connected or self.sock is None
+                                       or not safety.is_set()):
+                return False
+            self._outstanding += 1
+            self._queue.put((cmd, safety, self.sock, on_sent, sent_event))
+        return True
+
+    def revoke_guard(self, safety):
+        """纯 Python 失效 hook：只拿发送锁撤销 guard，不回调、不操作 Tk。"""
+        with self._lock:
+            safety.clear()
+
+    def cancel_guarded_motion(self, safety, sent_event, expected_sock):
+        """仅停止本流程绑定的 PLC；不清通用队列，不触碰重连后的新 socket。"""
+        sent = False
+        error = None
+        with self._lock:
+            safety.clear()
+            if (expected_sock is not None and self.connected
+                    and self.sock is expected_sock and sent_event.is_set()):
+                try:
+                    expected_sock.sendall(CMD_ESTOP.encode("ascii"))
+                    sent = True
+                except OSError as e:
+                    error = e
+        # 回调必须在发送锁外；尤其不能引入 sender -> ScanClient 锁顺序。
+        if sent:
+            self.on_sent(CMD_ESTOP)
+        elif error is not None:
+            self.on_state_change(False, f"维护急停发送失败: {error}")
+            self.disconnect(expected_sock=expected_sock)
 
     def send_urgent(self, cmd: str):
         """急停指令：清空队列、立即发送，绕过 50ms 间隔"""
         while True:
             try:
                 self._queue.get_nowait()
+                with self._lock:
+                    self._outstanding -= 1
             except queue.Empty:
                 break
-        with self._lock:
-            sock = self.sock if self.connected else None
-        if sock is None:
-            self.on_state_change(False, f"未连接，急停指令未发送: {cmd}")
-            return
         try:
-            sock.sendall(cmd.encode("ascii"))
+            # 与已出队运动串行：q 之后绝不再发送已取消的维护运动。
+            with self._lock:
+                sock = self.sock if self.connected else None
+                if sock is not None:
+                    sock.sendall(cmd.encode("ascii"))
+            if sock is None:
+                self.on_state_change(False, f"未连接，急停指令未发送: {cmd}")
+                return
             self.on_sent(cmd)
         except OSError as e:
             self.on_state_change(False, f"急停发送失败: {e}")
-            self.disconnect()
+            self.disconnect(expected_sock=sock)
 
     def _send_loop(self):
         while True:
-            cmd = self._queue.get()
-            with self._lock:
-                sock = self.sock if self.connected else None
-            if sock is None:
-                self.on_state_change(False, f"未连接，指令被丢弃: {cmd}")
-                continue
+            cmd, safety, queued_sock, callback, sent_event = self._queue.get()
             try:
-                sock.sendall(cmd.encode("ascii"))
-                self.on_sent(cmd)
+                with self._lock:
+                    sock = self.sock if self.connected else None
+                    valid = (safety is None or
+                             (safety.is_set() and sock is queued_sock))
+                    if sock is not None and valid:
+                        if sent_event is not None:
+                            # sendall 失败也可能已部分下发，必须保守视作自身运动已发。
+                            sent_event.set()
+                        sock.sendall(cmd.encode("ascii"))
+                        sent_at = time.monotonic()
+                    else:
+                        sock = None
+                if sock is not None:
+                    if callback is not None:
+                        callback(sent_at)
+                    self.on_sent(cmd)
+                elif safety is None:
+                    self.on_state_change(False, f"未连接，指令被丢弃: {cmd}")
             except OSError as e:
                 self.on_state_change(False, f"发送失败: {e}")
-                self.disconnect()
+                self.disconnect(expected_sock=sock)
+            finally:
+                with self._lock:
+                    self._outstanding -= 1
             time.sleep(MIN_INTERVAL)
 
-    def _recv_loop(self):
-        """接收设备周期性上报的状态帧"""
+    def _recv_loop(self, sock):
+        """接收时间和 socket 一起交付，避免旧连接/排队的 POS 确认新运动。"""
         buffer = ""
+        buffer_received_at = None
         while True:
             with self._lock:
-                sock = self.sock if self.connected else None
-            if sock is None:
-                return
+                if self.sock is not sock or not self.connected:
+                    return
             try:
                 data = sock.recv(4096)
+                received_at = time.monotonic()
                 if not data:  # 对端关闭
-                    self.disconnect()
+                    self.disconnect(expected_sock=sock)
                     return
+                if not buffer:
+                    buffer_received_at = received_at
+                previous_length = len(buffer)
                 buffer += data.decode("ascii", errors="replace")
                 # 状态帧无结束符，按完整帧匹配后从缓冲区移除
                 while True:
                     m = STATUS_PATTERN.search(buffer)
                     if not m:
                         break
-                    self.on_receive(m.group(0))
+                    frame_received_at = (received_at if m.start() >= previous_length
+                                         else buffer_received_at)
+                    self.on_receive(m.group(0), sock, frame_received_at)
+                    previous_length = max(0, previous_length - m.end())
                     buffer = buffer[m.end():]
+                    buffer_received_at = received_at
                 # 防止异常数据无限堆积
                 if len(buffer) > 4096:
                     buffer = buffer[-1024:]
             except socket.timeout:
                 continue
             except OSError:
-                self.disconnect()
+                self.disconnect(expected_sock=sock)
                 return
 
 
@@ -572,13 +640,19 @@ class TcpSender:
 class ScanClient:
     """主动/被动连接共用一个命令和事件通道，先接管成功的 socket 胜出。"""
 
-    def __init__(self, on_state_change, on_ready, on_response):
+    def __init__(self, on_state_change, on_ready, on_response, can_start_job=None,
+                 on_channel_state=None, on_channel_invalidated=None):
         self.sock = None
         self.connected = False
         self.ready = False
         self.on_state_change = on_state_change  # func(bool, str)
         self.on_ready = on_ready                # func() 收到就绪帧
         self.on_response = on_response          # func(str) 收到一行回复
+        # channel 回调在通道锁内调用，只能写 Python 队列/同步撤销 guard，不能操作 Tk。
+        self.on_channel_response = None         # 可选 func(str, socket)
+        self.on_channel_state = on_channel_state  # 可选 func(bool, str, socket)
+        self.on_channel_invalidated = on_channel_invalidated  # 可选 func(socket)
+        self.can_start_job = can_start_job or (lambda: True)  # 接收线程调用，不能操作 Tk
         self._lock = threading.Lock()
         self._connecting = None                 # 尚未接管的主动连接
         self._listener = None
@@ -682,8 +756,11 @@ class ScanClient:
                 self.connected = False
                 self._close_socket(sock)
                 return False
-        # 不持锁调用 UI 回调：Tk.after 可能等待主线程。
-        self.on_state_change(True, f"扫描服务器{description}")
+            if self.on_channel_state is not None:
+                # 成功边界先入 UI 队列，再允许断开/新连接或启动 recv。
+                self.on_channel_state(True, f"扫描服务器{description}", sock)
+        if self.on_channel_state is None:
+            self.on_state_change(True, f"扫描服务器{description}")
         threading.Thread(target=self._recv_loop, args=(sock,), daemon=True).start()
         return True
 
@@ -714,11 +791,18 @@ class ScanClient:
             # 旧 recv/send 线程只可清理自己的连接，不能碰新连接。
             if self.sock is not sock:
                 return
+            if self.on_channel_invalidated is not None:
+                # 线性化点：先在 sender 锁内撤销 guard，再释放预约所属通道。
+                # 唯一跨锁方向为 ScanClient -> sender；发送线程不能反取通道锁。
+                self.on_channel_invalidated(sock)
             self.sock = None
             self.connected = False
             self.ready = False
             self._close_socket(sock)
-        self.on_state_change(False, message)
+            if self.on_channel_state is not None:
+                self.on_channel_state(False, message, sock)
+        if self.on_channel_state is None:
+            self.on_state_change(False, message)
 
     def send(self, data: str):
         """发送原始命令（调用方自行带 \r\n）。"""
@@ -766,7 +850,8 @@ class ScanClient:
                         continue
                     if line == "PING" or line.startswith("PING "):
                         ping = re.fullmatch(r"PING TOKEN=([0-9]+)", line)
-                        if ping and any(c != "0" for c in ping[1]):
+                        if (ping and any(c != "0" for c in ping[1])
+                                and self.can_start_job()):
                             if not self._send_on_socket(sock, f"PONG TOKEN={ping[1]}\r\n"):
                                 return
                         continue  # 包括非法 PING，都不进入任务事件
@@ -781,7 +866,14 @@ class ScanClient:
                         if notify:
                             self.on_ready()
                     if line.strip():
-                        self.on_response(line)
+                        if self.on_channel_response is not None:
+                            with self._lock:
+                                if self.sock is not sock:
+                                    return
+                                # 与失效边界按同一把锁排序；已完整收到的行先于 EOF 标记。
+                                self.on_channel_response(line, sock)
+                        else:
+                            self.on_response(line)
         except OSError:
             pass
         finally:
@@ -797,6 +889,20 @@ class MainWindow(tk.Tk):
         self.title("设备远程控制")
         self.tk.call("tk", "scaling", UI_SCALE)
         self.geometry(f"{WIN_SIZE[0] * UI_SCALE:.0f}x{WIN_SIZE[1] * UI_SCALE:.0f}")
+
+        # 接收线程只写 Python 队列；所有 Tk 操作均由主线程轮询执行。
+        self._ui_queue = queue.Queue()
+        self._closing = False
+        self._reset_workflow = None
+        self._reset_safety = None
+        self._reset_gate = threading.Event()
+        self._reset_channel_guard = None  # 不可变 (MFC socket, safety Event)，通道锁内发布
+        self._scan_event_channel = None    # 仅由主线程按有序连接边界更新
+        self._reset_motion_sent = None
+        self._encoder_token = 0
+        self._reset_widget_states = []
+        self._maintenance_pending = set()
+        self._plc_status_socket = None
 
         # 位置/开关状态以设备周期性上报的状态帧为准
         self.positions = {axis: 0.0 for axis in AXIS_LIMITS}
@@ -859,7 +965,12 @@ class MainWindow(tk.Tk):
             on_state_change=self._on_scan_state,
             on_ready=self._on_scan_ready,
             on_response=self._on_scan_response,
+            can_start_job=lambda: not self._reset_gate.is_set(),
+            on_channel_state=self._on_scan_state,
+            on_channel_invalidated=self._invalidate_reset_channel,
         )
+
+        self.scan.on_channel_response = self._on_scan_response
 
         # socket EVENT 主动事件队列（服务器广播，保留最近 N 条）
         self.event_queue = deque(maxlen=200)
@@ -885,6 +996,7 @@ class MainWindow(tk.Tk):
         self._build_status_bar()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(20, self._drain_ui_queue)
 
         # UI 和回调目标就绪后启动监听；主动连接仍按原方式保留。
         try:
@@ -898,6 +1010,27 @@ class MainWindow(tk.Tk):
 
         # 后台 HTTP 进度查询 API（不占 UI 线程）
         self.after(100, self._start_http_api)
+
+    def _post_ui(self, callback, *args):
+        if not self._closing:
+            self._ui_queue.put((callback, args))
+
+    def _drain_ui_queue(self):
+        if self._closing:
+            return
+        try:
+            for _ in range(500):
+                if self._closing:
+                    break
+                try:
+                    callback, args = self._ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                callback(*args)
+        finally:
+            # 单个回调异常仍由 Tk 报告，但不能永久停止其他网络/UI 回调。
+            if not self._closing:
+                self.after(20, self._drain_ui_queue)
 
     def _auto_connect(self):
         if not self.sender.connected:
@@ -927,6 +1060,7 @@ class MainWindow(tk.Tk):
 
     def _build_axis_frame(self, parent):
         frame = ttk.LabelFrame(parent, text="轴控制（位置来自设备周期性上报）")
+        self._axis_frame = frame
         frame.pack(fill="x", padx=8, pady=4, anchor="n")
 
         # 共享点动步长：不可手动输入，通过单选按钮切换（选项来自 config.toml）
@@ -979,9 +1113,16 @@ class MainWindow(tk.Tk):
             ttk.Label(frame, text=f"[{fmt_pos(lo)}, {fmt_pos(hi)}]",
                       foreground="gray").grid(row=row, column=6, padx=6)
 
+        reset_row = ttk.Frame(frame)
+        reset_row.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
+        self.encoder_reset_btn = ttk.Button(
+            reset_row, text="重置编码", command=self._start_encoder_reset)
+        self.encoder_reset_btn.pack(side="left", padx=4)
+        self.axis_widgets["X"].append(self.encoder_reset_btn)
+
         # 快捷位置按钮（X / Z 各一行）
         quick_x = ttk.Frame(frame)
-        quick_x.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
+        quick_x.grid(row=6, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_x, text="X 轴预设:").pack(side="left", padx=4)
         for text, target in [(f"零点位置 ({fmt_pos(X_ZERO)})", X_ZERO),
                              (f"起始位置 ({fmt_pos(X_HOME)})", X_HOME),
@@ -992,7 +1133,7 @@ class MainWindow(tk.Tk):
             self.axis_widgets["X"].append(b)
 
         quick_z = ttk.Frame(frame)
-        quick_z.grid(row=6, column=0, columnspan=7, sticky="w", pady=2)
+        quick_z.grid(row=7, column=0, columnspan=7, sticky="w", pady=2)
         ttk.Label(quick_z, text="Z 轴预设:").pack(side="left", padx=4)
         for text, target in [(f"打印高度 ({fmt_pos(PRINT_Z)})", PRINT_Z),
                              ("调试高度 (-10)", -10),
@@ -1007,11 +1148,11 @@ class MainWindow(tk.Tk):
         self.cycle_info_var = tk.StringVar(value="")
         self.eta_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.auto_count_var,
-                  foreground="#1565c0").grid(row=7, column=0, columnspan=7, pady=8)
+                  foreground="#1565c0").grid(row=8, column=0, columnspan=7, pady=8)
 
         self.last_report_var = tk.StringVar(value="等待设备上报...")
         ttk.Label(frame, textvariable=self.last_report_var,
-                  foreground="gray").grid(row=8, column=0, columnspan=7, pady=6)
+                  foreground="gray").grid(row=9, column=0, columnspan=7, pady=6)
 
     def _build_event_frame(self, parent):
         """socket EVENT 主动事件队列显示区域（轴控制下方）"""
@@ -1070,6 +1211,7 @@ class MainWindow(tk.Tk):
 
     def _build_device_frame(self, parent):
         frame = ttk.LabelFrame(parent, text="设备控制")
+        self._device_frame = frame
         frame.pack(fill="x", padx=8, pady=4)
 
         row1 = ttk.Frame(frame)
@@ -1165,6 +1307,7 @@ class MainWindow(tk.Tk):
 
     def _toggle_connect(self):
         if self.sender.connected:
+            self._abort_encoder_reset("手动断开 PLC")
             self.sender.disconnect()
         else:
             threading.Thread(target=self.sender.connect,
@@ -1172,6 +1315,7 @@ class MainWindow(tk.Tk):
 
     def _toggle_scan(self):
         if self.scan.connected:
+            self._abort_encoder_reset("手动断开 MFC")
             self.scan.disconnect()
         else:
             threading.Thread(target=self.scan.connect,
@@ -1179,10 +1323,19 @@ class MainWindow(tk.Tk):
 
     # ---------- 扫描服务器回调 ----------
 
-    def _on_scan_state(self, connected: bool, msg: str):
+    def _on_scan_state(self, connected: bool, msg: str, channel=None):
         def update():
-            # 回调排入Tk队列后连接可能已切换，UI以当前通道状态为准。
+            if channel is not None:
+                if connected:
+                    self._scan_event_channel = channel
+                elif self._scan_event_channel is channel:
+                    self._scan_event_channel = None
+                # 晚到的旧 False 不得抹掉已消费的新 True。
+            # 展示取实时网络状态；打印事件归属则取上述主线程有序会话。
             current_connected = self.scan.connected
+            if (getattr(self, "_reset_workflow", None) is not None
+                    and self._encoder_active() and not self._reset_ready()):
+                self._abort_encoder_reset("MFC 连接断开/切换")
             self.scan_btn.config(text="断开" if current_connected else "连接")
             self.scan_ready_var.set(
                 "就绪 (NETSCAN_SERVER_READY)" if current_connected and self.scan.ready
@@ -1192,7 +1345,7 @@ class MainWindow(tk.Tk):
                                   or self._press_ink_repeat_after is not None):
                 self._set_press_ink_repeat(False)
                 self._append_log("[压墨] 扫描服务器已断开，循环压墨已关闭\n")
-        self.after(0, update)
+        self._post_ui(update)
 
     def _on_scan_ready(self):
         def update():
@@ -1200,14 +1353,17 @@ class MainWindow(tk.Tk):
                 return  # 忽略已断开的旧通道延迟到达的UI回调。
             self.scan_ready_var.set("就绪 (NETSCAN_SERVER_READY)")
             self._append_log("[扫描] 收到就绪帧: NETSCAN_SERVER_READY\n")
-        self.after(0, update)
+        self._post_ui(update)
 
     def _send_flash(self):
         """发送闪喷命令 FLASH\r\n 到扫描服务器"""
+        if self._encoder_active():
+            return
         if not self.scan.connected:
             messagebox.showwarning("提示", "扫描服务器未连接")
             return
         if self.scan.send(f"{CMD_FLASH}\r\n"):
+            self._maintenance_pending.add("FLASH")
             self._append_log(f"[闪喷] 发送: {CMD_FLASH}\r\n")
 
     def _select_press_ink_time(self):
@@ -1219,16 +1375,31 @@ class MainWindow(tk.Tk):
         cmd = self.custom_cmd_var.get().strip()
         if not cmd:
             return
+        if self._encoder_active():
+            if cmd.lower() == CMD_ESTOP:
+                self._emergency_stop()
+            else:
+                self._append_log("[重置编码] 维护期间拒绝自定义命令\n")
+            return
+        if any(word in cmd.upper() for word in ("ENCODER_RESET", "RESET_ENCODER")):
+            self._append_log("[重置编码] 请使用重置编码按钮，不允许绕过维护协议\n")
+            return
         if self.custom_target_var.get() == "扫描服务器":
             if not self.scan.connected:
                 messagebox.showwarning("提示", "扫描服务器未连接")
                 return
             if self.scan.send(f"{cmd}\r\n"):
+                # 原始命令缺乏统一完成语义，停止后才能开始编码器维护。
+                self._maintenance_pending.add("CUSTOM")
                 self._append_log(f"[自定义] 发送: {cmd}\r\n")
         else:
             if not self.sender.connected:
                 messagebox.showwarning("提示", "设备未连接")
                 return
+            if cmd.lower() == CMD_ESTOP:
+                self._emergency_stop()
+                return
+            self._maintenance_pending.add("CUSTOM_PLC")
             self.sender.send_command(cmd)
             self._append_log(f"[自定义] 发送: {cmd}\r\n")
 
@@ -1245,6 +1416,8 @@ class MainWindow(tk.Tk):
             activebackground="#9ec7f0" if enabled else "#d9d9d9")
 
     def _toggle_press_ink_repeat(self):
+        if self._encoder_active():
+            return
         enabled = not self._press_ink_repeat_enabled
         self._set_press_ink_repeat(enabled)
         if enabled:
@@ -1272,6 +1445,8 @@ class MainWindow(tk.Tk):
 
     def _send_press_ink(self, repeated=False):
         """发送压墨命令；循环开启时，在成功发送后安排下一次压墨。"""
+        if self._encoder_active():
+            return
         if not self.scan.connected:
             if repeated:
                 self._set_press_ink_repeat(False)
@@ -1281,6 +1456,7 @@ class MainWindow(tk.Tk):
             return
         seconds = self.press_ink_seconds
         if self.scan.send(f"PRESS_INK {fmt_pos(seconds)}\r\n"):
+            self._maintenance_pending.add("PRESS_INK")
             source = "循环" if repeated else "手动"
             self._append_log(f"[压墨] {source}发送: PRESS_INK {fmt_pos(seconds)}\r\n")
             self._schedule_press_ink_repeat(seconds)
@@ -1288,9 +1464,26 @@ class MainWindow(tk.Tk):
             self._set_press_ink_repeat(False)
             self._append_log("[压墨] 循环命令发送失败，循环压墨已关闭\n")
 
-    def _on_scan_response(self, line: str):
+    def _on_scan_response(self, line: str, channel=None):
         def update():
+            if channel is not None and channel is not self._scan_event_channel:
+                return
+            # 正常打印事件按 UI 已消费的会话处理，即使此时网络端已经 EOF。
+            # 编码器 ACK 则仍受下面的实时 _reset_ready/original socket 门禁约束。
             self._append_log(f"[扫描回复] {line}\n")
+            if self._encoder_active() and not self._reset_ready():
+                self._abort_encoder_reset("回复到达时连接已失效")
+                return
+            if self._reset_workflow is not None and self._reset_workflow.response(line):
+                return
+            if self._encoder_active() and line.strip().startswith("EVENT "):
+                if (START_JOB_PATTERN.fullmatch(line.strip())
+                        and self._reset_workflow.phase == "begin"):
+                    # PING 可能先于本地 BEGIN 获得许可；未预约成功时让出打印。
+                    self._abort_encoder_reset("预约前收到 START_JOB，取消未动维护并让出打印")
+                else:
+                    self._abort_encoder_reset("预约后/非 START_JOB 打印事件冲突，拒绝执行")
+                    return
             if line.strip().startswith("EVENT "):
                 # 服务器主动事件：压入事件队列并显示
                 self._enqueue_event(line.strip())
@@ -1366,11 +1559,15 @@ class MainWindow(tk.Tk):
                 self._remove_event(line.strip())
                 return
             if "PRESS_INK" in line:
-                # 压墨完成/结果回送，仅记录日志
+                if re.fullmatch(r"OK PRESS_INK SECONDS=\d+(?:\.\d+)? "
+                                r"RESULT=\w+ STATE=OFF", line.strip()):
+                    self._maintenance_pending.discard("PRESS_INK")
+                # 接受回复不能当成完成；仅确认最终 OFF 后解除维护门禁。
                 self._append_log(f"[压墨] {line}\n")
                 return
             m = FLASH_RESPONSE_PATTERN.fullmatch(line.strip())
             if m:
+                self._maintenance_pending.discard("FLASH")
                 before, after = m.group(1), m.group(2)
                 self.flash_on = after == "ON"
                 self.flash_btn.config(text=f"闪喷: {'开' if self.flash_on else '关'}")
@@ -1387,7 +1584,122 @@ class MainWindow(tk.Tk):
                 self._append_log(f"[闪喷] 已接受: {FLASH_ACCEPTED}\n")
             elif line.startswith("未知命令"):
                 self._append_log(f"[闪喷] 未知命令回复: {line}\n")
-        self.after(0, update)
+        self._post_ui(update)
+
+    # ---------- 编码器维护（独立于打印/暂停状态机） ----------
+
+    def _encoder_active(self):
+        return self._reset_workflow is not None and self._reset_workflow.active
+
+    def _reset_ready(self):
+        return (self.sender.connected and self.sender.sock is self._reset_plc_socket
+                and self.scan.connected and self.scan.ready
+                and self.scan.sock is self._reset_scan_socket)
+
+    def _set_reset_lock(self, locked):
+        if not locked:
+            for widget, state in self._reset_widget_states:
+                widget.configure(state=state)
+            self._reset_widget_states.clear()
+            return
+
+        def visit(widget):
+            if widget is self.estop_btn:
+                return
+            if "state" in widget.keys():
+                self._reset_widget_states.append((widget, widget.cget("state")))
+                widget.configure(state="disabled")
+            for child in widget.winfo_children():
+                visit(child)
+
+        for root in (self._axis_frame, self._device_frame):
+            visit(root)
+        self._reset_widget_states.append((self.pause_btn, self.pause_btn.cget("state")))
+        self.pause_btn.configure(state="disabled")
+
+    def _invalidate_reset_channel(self, channel):
+        """接收/断线线程调用；ScanClient 持锁，只同步撤销对应 guard。"""
+        binding = self._reset_channel_guard
+        if binding is not None and binding[0] is channel:
+            self.sender.revoke_guard(binding[1])
+
+    def _next_encoder_token(self):
+        self._encoder_token += 1
+        return self._encoder_token
+
+    def _start_encoder_reset(self):
+        if (self._encoder_active() or self._auto_active or self._pending
+                or self._maintenance_pending or self.flash_on
+                or self._press_ink_repeat_enabled or self._press_ink_repeat_after is not None
+                or self._flash_pausing or self._flash_wait_off
+                or self._flash_after is not None or self._flash_wait_after is not None
+                or self._server_stop_after is not None or not self.sender.idle):
+            self._append_log("[重置编码] 拒绝：打印/运动/维护任务正忙\n")
+            return
+        if (not self.sender.connected or self.sender.sock is None
+                or self._plc_status_socket is not self.sender.sock
+                or not self.scan.connected or not self.scan.ready or self.scan.sock is None):
+            self._append_log("[重置编码] 拒绝：PLC 尚无当前连接 POS 或 MFC 未就绪\n")
+            return
+        lo, hi = AXIS_LIMITS["X"]
+        if not (lo <= -5 <= hi and lo <= 0 <= hi):
+            self._append_log("[重置编码] 拒绝：X 行程必须包含 0 和 -5\n")
+            return
+        # 与 MFC 失效 hook 同步发布 guard，避免“EOF 已撤销完才发布新 guard”的空窗。
+        with self.scan._lock:
+            channel_ready = self.scan.connected and self.scan.ready and self.scan.sock is not None
+            if channel_ready:
+                self._reset_plc_socket = self.sender.sock
+                self._reset_scan_socket = self.scan.sock
+                self._reset_safety = threading.Event()
+                self._reset_motion_sent = threading.Event()
+                self._reset_safety.set()
+                self._reset_channel_guard = (self._reset_scan_socket, self._reset_safety)
+                self._reset_gate.set()
+        if not channel_ready:
+            self._append_log("[重置编码] 拒绝：MFC 在启动前失效\n")
+            return
+        self._reset_workflow = EncoderResetWorkflow(
+            send=lambda data: self.scan._send_on_socket(self._reset_scan_socket, data),
+            move=self._reset_move, stop=self._reset_stop_motion,
+            ready=self._reset_ready, schedule=self.after, unschedule=self.after_cancel,
+            finished=self._reset_finished, tolerance=POS_TOLERANCE,
+            token_factory=self._next_encoder_token)
+        self._set_reset_lock(True)
+        self.status_var.set("重置编码维护中：三轴已锁定，等待预约/新 POS/编码确认")
+        self._append_log("[重置编码] 开始预约；X=0 → 硬件复位 → X=-5\n")
+        if not self._reset_workflow.start():
+            self._reset_finished(False, "连接在启动前失效")
+
+    def _reset_move(self, target, token, phase):
+        if not self._reset_ready() or not self._encoder_active():
+            return False
+        workflow = self._reset_workflow
+        return self.sender.send_command(
+            f"X={target}", safety=self._reset_safety,
+            on_sent=lambda sent_at: self._post_ui(
+                workflow.motion_sent, token, phase, sent_at),
+            sent_event=self._reset_motion_sent)
+
+    def _reset_stop_motion(self):
+        if self._reset_safety is not None:
+            self.sender.cancel_guarded_motion(
+                self._reset_safety, self._reset_motion_sent, self._reset_plc_socket)
+
+    def _reset_finished(self, success, reason):
+        if self._reset_safety is not None:
+            self._reset_safety.clear()
+        self._reset_safety = None
+        self._reset_channel_guard = None
+        self._reset_motion_sent = None
+        self._reset_gate.clear()
+        self._set_reset_lock(False)
+        self.status_var.set(reason)
+        self._append_log(f"[重置编码] {'完成' if success else '安全中止'}：{reason}\n")
+
+    def _abort_encoder_reset(self, reason):
+        if self._encoder_active():
+            self._reset_workflow.abort(reason)
 
     # ---------- 轴控制 ----------
 
@@ -1401,6 +1713,8 @@ class MainWindow(tk.Tk):
         return True
 
     def _move_absolute(self, axis: str):
+        if self._encoder_active():
+            return
         try:
             target = float(self.target_vars[axis].get().strip())
         except ValueError:
@@ -1413,12 +1727,16 @@ class MainWindow(tk.Tk):
 
     def _move_to(self, axis: str, target: float):
         """移动到指定绝对位置（快捷按钮用）"""
+        if self._encoder_active():
+            return
         if not self._check_range(axis, target):
             return
         self.sender.send_command(f"{axis}={fmt_pos(target)}")
         self._wait_target(axis, target)
 
     def _jog(self, axis: str, direction: int):
+        if self._encoder_active():
+            return
         try:
             step = abs(float(self.step_var.get().strip()))
         except ValueError:
@@ -1439,6 +1757,8 @@ class MainWindow(tk.Tk):
         retry_timeout_ms: 自动流程中发送指令后超时未到位时，自动按目标
         绝对位置重新发送指令（None/0 表示关闭重发，无限等待）。
         """
+        if self._encoder_active():
+            return
         # If the axis is already at the requested target, some devices do not
         # emit a subsequent status frame.  Advance immediately so the
         # automatic workflow cannot remain stuck waiting for arrival.
@@ -1520,6 +1840,8 @@ class MainWindow(tk.Tk):
 
     def _check_arrival(self):
         """每次收到状态帧后调用：到达的轴解锁；自动循环时推进下一段"""
+        if self._encoder_active():
+            return  # 编码器维护仅由带接收时间的新 POS 推进，绝不使用 positions 缓存。
         arrived = [a for a, t in self._pending.items()
                    if abs(self.positions[a] - t) <= POS_TOLERANCE]
         for a in arrived:
@@ -1579,6 +1901,8 @@ class MainWindow(tk.Tk):
         self.pause_btn.config(text="暂停")
 
     def _toggle_workflow_pause(self):
+        if self._encoder_active():
+            return
         if not self._workflow_paused:
             self._workflow_paused = True
             self.pause_btn.config(text="恢复")
@@ -1636,6 +1960,11 @@ class MainWindow(tk.Tk):
         由服务器广播事件（START_JOB / LAYER_START / PASS_READY）驱动。
         当前仅锁定 X/Y/Z 三轴（循环参数不参与锁定，下方流程不会用到）。
         """
+        if self._encoder_active():
+            before_reservation = self._reset_workflow.phase == "begin"
+            self._abort_encoder_reset("START_JOB 与维护冲突")
+            if not before_reservation:
+                return
         # 每次 START_JOB 都视为新任务，清空上一任务的队列、目标和定时器。
         self._pending.clear()
         self._cancel_all_axis_retries()
@@ -2427,6 +2756,8 @@ class MainWindow(tk.Tk):
 
     def _emergency_stop(self):
         """强制停止打印：发送 q，清空服务器任务状态并解锁所有轴。"""
+        self._abort_encoder_reset("用户停止/急停")
+        self._maintenance_pending.clear()
         self.sender.send_urgent(CMD_ESTOP)
         self._auto_active = False
         self._auto_mode = None
@@ -2459,10 +2790,14 @@ class MainWindow(tk.Tk):
     # ---------- 回调与日志 ----------
 
     def _on_sent(self, cmd: str):
-        self.after(0, self._append_log, f"[发送] {cmd}\n")
+        self._post_ui(self._append_log, f"[发送] {cmd}\n")
 
-    def _on_status(self, frame: str):
-        """收到设备状态帧: POS:X=+014.88,Y=+000.00,Z=+000.00,D=0,G=0"""
+    def _on_status(self, frame: str, channel=None, received_at=None):
+        """接收线程捕获时间/socket，主线程处理时不把旧 POS 当成新反馈。"""
+        if received_at is None:
+            received_at = time.monotonic()
+        if channel is None:
+            channel = self.sender.sock
         m = STATUS_PATTERN.fullmatch(frame)
         if not m:
             return
@@ -2470,6 +2805,9 @@ class MainWindow(tk.Tk):
         uv, roller = int(m.group(4)) != 0, int(m.group(5)) != 0
 
         def update():
+            if not self.sender.connected or channel is not self.sender.sock:
+                return
+            self._plc_status_socket = channel
             self.positions.update({"X": x, "Y": y, "Z": z})
             for axis in self.positions:
                 self._refresh_position(axis)
@@ -2479,16 +2817,24 @@ class MainWindow(tk.Tk):
             self.roller_btn.config(text=f"滚子: {'运行' if roller else '停止'}")
             self.last_report_var.set(
                 f"最后上报: {time.strftime('%H:%M:%S')}  {frame}")
-            self._check_arrival()
-            self._auto_uv_position_check(x)
-        self.after(0, update)
+            if self._encoder_active():
+                self._reset_workflow.position(x, received_at)
+            else:
+                self._check_arrival()
+                self._auto_uv_position_check(x)
+        self._post_ui(update)
 
     def _on_state_change(self, connected: bool, msg: str):
         def update():
+            current_connected = self.sender.connected
             self.status_var.set(msg)
-            self.connect_btn.config(text="断开" if connected else "连接")
+            self.connect_btn.config(text="断开" if current_connected else "连接")
             self._append_log(f"[状态] {msg}\n")
-            if not connected:
+            if (self._encoder_active() and not self._reset_ready()):
+                self._abort_encoder_reset("PLC 连接断开/切换")
+            if not current_connected:
+                self._plc_status_socket = None
+                self._maintenance_pending.clear()
                 # 断开后清空等待目标并解锁，避免卡死
                 self._pending.clear()
                 self._cancel_all_axis_retries()
@@ -2500,7 +2846,7 @@ class MainWindow(tk.Tk):
                 self.cycle_info_var.set("")
                 self.eta_var.set("")
                 self._unlock_all()
-        self.after(0, update)
+        self._post_ui(update)
 
     def _append_log(self, text: str):
         self.log_text.config(state="normal")
@@ -2549,6 +2895,8 @@ class MainWindow(tk.Tk):
             self._http_server = None
 
     def _on_close(self):
+        self._abort_encoder_reset("关闭窗口")
+        self._closing = True
         self._set_press_ink_repeat(False)
         self._stop_http_api()
         self.sender.disconnect()

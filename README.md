@@ -43,7 +43,7 @@ Python 启动后同时保留原有主动连接 `19090` 的行为和 UI“连接/
 1. MFC 把任一方向的连接加入通道时先发送 `NETSCAN_SERVER_READY\r\n`。
 2. Python 安装连接后立即主动发送 `HELLO PLC\r\n`，**不等待 READY**。
 3. MFC 收到 HELLO 后回复 `OK HELLO PLC\r\n`；初始 READY 已足够，不要求也不依赖再次发送 READY。
-4. MFC 仅在启动任务时发送 `PING TOKEN=<正整数>\r\n`（token 递增，MFC 等待回包超时为 3 秒）。Python 在接收线程中通过原 socket 直接回复 `PONG TOKEN=<原token>\r\n`，不经过 UI/任务事件队列，也保留 token 的原始数字文本。
+4. MFC 仅在启动任务时发送 `PING TOKEN=<正整数>\r\n`（token 递增，MFC 等待回包超时为 3 秒）。Python 在接收线程中通过原 socket 直接回复 `PONG TOKEN=<原token>\r\n`，不经过 UI/任务事件队列，也保留 token 的原始数字文本。**重置编码流程活跃时不回 PONG**，避免 MFC 同时获得打印启动权限；结束/取消后恢复。`ScanClient.can_start_job` 是可选的接收线程回调，缺省放行，主窗口只读取线程安全 Event，不调用 Tk，也不增加任何协议命令。
 
 `OK HELLO PLC`、`PING`、`PONG` 是内部握手/心跳帧，不会作为任务事件派发；PING 不会触发任何运动。原有 `EVENT ...` 和命令回复沿用原回调，接收缓冲保留半行，完整分行后才派发。旧连接的接收线程只能关闭自己的 socket，不能影响重连后的新连接。
 
@@ -57,6 +57,48 @@ X 轴速度在 `config.toml` 的 `[auto_cycle]` 中配置，取值为 1~100 的�
 - **扫描服务器**：`127.0.0.1:19090`，负责闪喷（`FLASH`）指令，回送 `OK ...` 结果
 
 > **设备协议限制：Y 相对移动指令最多只能有两位小数。** `PASS_READY` 的 `STEP` 单位为 μm，程序先换算成 mm，再四舍五入到两位小数后发送。例如：`STEP=1714` → `Y+1.71`，`STEP=1715` → `Y+1.72`，`STEP=-1715` → `Y-1.72`。Y 的到位目标也必须使用舍入后的距离计算，不能使用原始的三位小数值。
+
+## 重置编码（手动维护）
+
+轴控制区三轴点动下方、预设按钮之前增加 **“重置编码”**。确认机械路径安全后点击一次，程序自动完成 **X=0 → MFC 硬件编码器复位 → X=-5**。不使用打印“暂停/恢复”，不使用固定 sleep 判断到位。日志和状态栏显示完成/中止结果；只有返程到位且 END 成功回复后才算完成。
+
+### 启动门禁与锁定
+
+- PLC 必须连接，且当前 PLC socket 已收到过有效 POS；MFC 必须连接并收到 `NETSCAN_SERVER_READY`。此首次 POS **仅作连接门禁，不能用于本次运动到位判断**。
+- 自动打印、任一轴 pending、未发送完的 PLC 队列、闪喷/压墨未完成、循环压墨或其他维护等待期间拒绝启动；X 配置行程必须同时包含 `0` 和 `-5`，否则不发送 BEGIN、不移动。
+- 整个流程锁定 X/Y/Z、目标输入、点动步长、预设及设备相关参数/维护/自定义命令；重置按钮也加入 X 轴锁组，自动打印时不可按。**急停和事件区“停止”始终可用**，连接区可断开。主逻辑同样防止重入、手动运动和自定义命令覆盖目标。
+- 自定义命令缺少可靠的完成语义：正常发送仍保留，但发送原始 PLC/扫描命令后，会保守阻止重置编码，需先点“停止”清理；不要通过自定义命令调用编码器协议。
+
+### 严格顺序与协议
+
+所有 MFC 消息使用 **ASCII + CRLF**、同一活跃 socket、一次流程一个正整数 TOKEN。TOKEN 单调递增且限制在 MFC 有符号 32 位 LONG 范围 `1..2147483647`，溢出在任何发送之前拒绝，不使用时间戳大整数：
+
+1. Python 发 `ENCODER_RESET_BEGIN TOKEN=n`，只预约维护。必须收到 `OK ENCODER_RESET_BEGIN TOKEN=n` 才允许运动；MFC 预约期间禁止启动打印。ERR（如 `BUSY/STOPPING/NOT_READY`）则取消，不能移动。
+2. Python 排队发送 PLC `X=0`。等待实际发送完成之后收到的**新 POS**，确认 `abs(X) <= POS_TOLERANCE`（默认 `0.1 mm`）；初始化的 `positions=0`、点击前缓存、发送前收到但延迟派发的 POS 都不能触发复位。
+3. Python 发 `RESET_ENCODER TOKEN=n`。MFC 执行原 `DEV_ResetPrinterEncValue(ZERO_POSITION)`，必须收到 `OK RESET_ENCODER TOKEN=n ENC=1048576` 才返程。`ERR ... REASON=...` 按原因文本兼容处理（包括 `BUSY/FAILED/NOT_RESERVED/STOPPING/NOT_READY/NOT_RESET/INVALID_TOKEN`）；错误或错误 ENC **绝不发送 X=-5**。
+4. 发送 PLC `X=-5`，同样等待实际发送之后的新 POS 到位，再发 `ENCODER_RESET_END TOKEN=n`；收到 `OK ENCODER_RESET_END TOKEN=n` 后完成解锁。**END ACK 超时同样按失败处理**。
+5. 停止/断线/失败/超时会失活流程、撤销尚未发送的本次运动、取消定时器，并尽力用原 MFC socket 发 `ENCODER_RESET_CANCEL TOKEN=n`。MFC 幂等回复 `OK ENCODER_RESET_CANCEL TOKEN=n`；MFC socket 断开也会清除其预约。迟到/旧 TOKEN/旧 socket 的回包不触发移动。
+
+运动阶段超时默认 **30 秒**，BEGIN/RESET/END ACK 默认 **5 秒**（`encoder_reset.py` 常量及构造参数；测试可注入 fake clock/调度器）。只有**本流程确实下发过 X 运动**（发送失败时可能已部分下发也保守计入）才因维护取消发送 `q`；BEGIN 拒绝/超时或尚未发送运动时不发 `q`，避免误停刚获得打印权限的任务。用户显式点击急停/停止仍保留原本立即 `q` 的含义。
+
+### 同时点击 MFC 开始与重置
+
+- 活跃维护通过 PING 门禁不再授予新的打印启动许可。
+- PING 可能恰好先于本地 BEGIN 获得许可：如果 BEGIN **尚未成功**时收到 `EVENT START_JOB`，取消未动维护（不发 `q`），再交回原有 START_JOB 打印逻辑。
+- BEGIN **已成功预约**后若仍收到 START_JOB，则视为协议/任务冲突：取消维护（自身已运动才 `q`）并拒绝该事件。维护期间其他打印事件同样不混入状态机或覆盖目标。
+
+发送器改动只用于安全确认/撤销：维护队列项绑定 socket、取消 Event，发送锁内标记“自身运动已下发”，发送完成回调携带 monotonic 时间；POS 同样携带接收时间和 socket。队列入队本身不是发送 ACK。正常打印段/到位推进逻辑保持原有行为。
+
+并发安全边界：
+
+- **MFC 失效立即撤销 guard**：`ScanClient.on_channel_invalidated(socket)` 是纯 Python hook，在活跃通道锁内、清除 socket 之前调用，只在 PLC 发送锁内清除对应 Event；不等待 Tk 清理、不操作 Tk。guard 发布同样受通道锁保护。唯一跨锁顺序为 `ScanClient → TcpSender`，发送线程只检查 Event，不反取 ScanClient 锁。
+- **取消只作用于原 PLC**：`cancel_guarded_motion` 在发送锁内核对 `expected_sock`，只有原 PLC 仍是当前连接且本流程已发送运动才 `q`；不调用通用急停、不清其他队列，已取消的自身项由发送线程丢弃。原 A 断开、B 重连后取消 A 流程不会 `q` B，也不会清 B 的队列；用户显式急停仍保持当前连接 `q` 并清队列的原语义。
+- **POS/发送回调可反序**：运动阶段可暂存本阶段实际收到、接收时间最新的一个 POS 候选；发送完成回调到达后，仅重放 `received_at > sent_at` 的候选。阶段切换及中止立即清空，不能从 `positions` 缓存补到位，也不需要设备额外再上报一帧。
+- **打印事件与编码器 ACK 分开判定**：可选 `on_channel_state(connected, message, socket)` 与 `on_channel_response` 在通道锁内只向 Python UI 队列投递；连接成功边界先于 recv 启动，完整事件先于断开边界。主线程用已消费的 socket 会话过滤打印事件，因此已收到的 `PRINT_JOB_COMPLETED` 紧跟 EOF 仍能结束任务；快速重连后旧事件不混入新任务，晚到旧 False 不覆盖新会话。编码器 ACK 仍额外要求原 socket **实时有效且 ready**，不能靠旧会话中排队的成功回包恢复运动。未提供可选回调时仍兼容原两参连接回调。
+
+除上述同步撤销 Event 外，网络线程只向 Python 队列写回调；全部 Tk 更新、状态机推进和定时器清理由主线程处理。
+
+> 网络故障时 `q`/CANCEL 都只能尽力发送，不能替代硬件急停。取消不代表机械已回零或编码已恢复；检查实际坐标和设备状态后再重试。若 CANCEL 未送达且 MFC 仍占用预约，可断开 MFC 通道释放；不要绕过门禁强行打印。
 
 ## 服务器驱动打印流程
 
@@ -218,10 +260,10 @@ flowchart TD
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile device_control.py tests/test_scan_client.py
+python -m py_compile device_control.py encoder_reset.py tests/test_scan_client.py tests/test_encoder_reset.py
 ```
 
-测试通过 AST 仅提取 `ScanClient`，不会导入或启动 `MainWindow`、PLC 控制逻辑、HTTP API，也不会连接真实设备或固定服务端口。网络测试仅使用本机随机空闲端口及模拟 socket，覆盖主动/被动连接、握手、PING 回包、EVENT 分行/半包保留、连接竞争、旧线程归属、关闭监听，以及手动断开暂停反向接管、点击连接恢复、主动失败保留监听和接收失败自动重连。
+测试通过 AST 提取 `ScanClient`、`TcpSender` 和主窗口方法，并直接测试无 Tk 依赖的 `encoder_reset.py`；不创建窗口、不启动 HTTP API、不连接真实设备或固定服务端口。网络测试仅使用本机随机空闲端口及模拟 socket，保留原有主动/被动连接、握手、分包、连接竞争/重连测试。新增 fake clock/发送队列测试覆盖严格成功顺序、新 POS 门禁、两段运动确认、END ACK、旧 TOKEN/socket、ERR 原因、忙碌/行程/连接拒绝、超时/停止/断线清理、自定义/打印事件隔离、PING 门禁、预约前让出 START_JOB 不误发 q、预约后拒绝 START_JOB，以及发送与取消并发、发送回调延迟时仍能识别自身已发运动。回归测试还覆盖 MFC EOF 后 Tk 未清理前撤销待发 X、旧 PLC 取消不影响重连 PLC 或其他队列、双线程反序投递 POS/发送回调、完成事件紧跟 EOF、快速重连会话隔离和旧编码器 ACK 不推进。
 
 ## 其他功能
 
