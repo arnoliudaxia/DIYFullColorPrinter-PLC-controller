@@ -1261,7 +1261,7 @@ class MainWindow(tk.Tk):
         ttk.Label(row2, text="UV灯水平距离 (mm):").pack(side="left", padx=(16, 2), pady=4)
         self.uv_dist_var = tk.StringVar(value=fmt_pos(UV_OFFSET_DEFAULT))
         ttk.Entry(row2, textvariable=self.uv_dist_var, width=8).pack(side="left", padx=2)
-        # 自动UV灯: 自动循环中 X 向终点移动时开灯，其他情况关灯
+        # 自动UV灯: 去程到阈值开灯，终点保持，回程越过同一阈值后关灯
         self.auto_uv_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row2, text="自动UV灯", variable=self.auto_uv_var,
                         command=self._auto_uv_toggled).pack(side="left", padx=16)
@@ -1517,6 +1517,8 @@ class MainWindow(tk.Tk):
                     self._pending.clear()
                     self._cancel_all_axis_retries()
                     self._auto_leg = "wait_layer"
+                    # 新层抢占已离开UV保持段，即使暂停阻止定位也要先关灯。
+                    self._auto_uv_update()
                     self.event_queue = deque(
                         (ts, ev) for ts, ev in self.event_queue
                         if not (PASS_READY_PATTERN.fullmatch(ev)
@@ -1642,8 +1644,10 @@ class MainWindow(tk.Tk):
             self._append_log("[重置编码] 拒绝：PLC 尚无当前连接 POS 或 MFC 未就绪\n")
             return
         lo, hi = AXIS_LIMITS["X"]
-        if not (lo <= -5 <= hi and lo <= 0 <= hi):
-            self._append_log("[重置编码] 拒绝：X 行程必须包含 0 和 -5\n")
+        if not (lo <= X_HOME <= hi and lo <= X_ZERO <= hi):
+            self._append_log(
+                f"[重置编码] 拒绝：X 行程必须包含配置的零点位置 {fmt_pos(X_ZERO)} "
+                f"和起始位置 {fmt_pos(X_HOME)}\n")
             return
         # 与 MFC 失效 hook 同步发布 guard，避免“EOF 已撤销完才发布新 guard”的空窗。
         with self.scan._lock:
@@ -1664,19 +1668,27 @@ class MainWindow(tk.Tk):
             move=self._reset_move, stop=self._reset_stop_motion,
             ready=self._reset_ready, schedule=self.after, unschedule=self.after_cancel,
             finished=self._reset_finished, tolerance=POS_TOLERANCE,
-            token_factory=self._next_encoder_token)
+            token_factory=self._next_encoder_token,
+            zero_position=X_ZERO, home_position=X_HOME,
+            progress=self._reset_progress)
         self._set_reset_lock(True)
-        self.status_var.set("重置编码维护中：三轴已锁定，等待预约/新 POS/编码确认")
-        self._append_log("[重置编码] 开始预约；X=0 → 硬件复位 → X=-5\n")
+        self.status_var.set("重置编码维护中：三轴已锁定，等待预约/零点停稳/复位后2秒")
+        self._append_log(
+            f"[重置编码] 开始预约；零点 X={fmt_pos(X_ZERO)} 并确认停稳 "
+            f"→ MFC复位指令 → 等待2秒 → 起始位置 X={fmt_pos(X_HOME)}\n")
         if not self._reset_workflow.start():
             self._reset_finished(False, "连接在启动前失效")
+
+    def _reset_progress(self, message):
+        self.status_var.set(message)
+        self._append_log(f"[重置编码] {message}\n")
 
     def _reset_move(self, target, token, phase):
         if not self._reset_ready() or not self._encoder_active():
             return False
         workflow = self._reset_workflow
         return self.sender.send_command(
-            f"X={target}", safety=self._reset_safety,
+            f"X={fmt_pos(target)}", safety=self._reset_safety,
             on_sent=lambda sent_at: self._post_ui(
                 workflow.motion_sent, token, phase, sent_at),
             sent_event=self._reset_motion_sent)
@@ -2602,7 +2614,9 @@ class MainWindow(tk.Tk):
         if self._auto_leg == "end":
             if self._auto_mode == "server":
                 # 服务器模式以 X 到达配置终点即视为 PASS 完成，不再等待或急停。
-                self._set_uv(False)
+                # 自动UV保持开启，直到回程越过原开灯位置；未启用时沿用原关闭行为。
+                if not self.auto_uv_var.get():
+                    self._set_uv(False)
                 self._flash_count += 1
                 self._update_auto_counts()
                 if (self.flash_maintain_var.get()
@@ -2729,18 +2743,25 @@ class MainWindow(tk.Tk):
         self.uv_btn.config(text=f"UV 灯: {'开' if on else '关'}")
 
     def _auto_uv_update(self):
-        """自动UV灯: 非"向终点移动"的段一律关灯；向终点段的开灯由位置触发"""
+        """去程开灯后跨越终点等待/维护，回程越过同一位置才关灯。"""
         if not self.auto_uv_var.get():
             return
-        if not (self._auto_active and self._auto_leg == "end"):
+        hold_legs = ("end", "wait_after_pass_stop", "server_flash_offset",
+                     "server_flash_pause", "pass_return_home", "home")
+        if not (self._auto_active and self._auto_leg in hold_legs):
             self._set_uv(False)
+        elif self._auto_leg in ("pass_return_home", "home"):
+            # 已在阈值内侧时立即关闭，不必再等待下一帧 POS。
+            self._auto_uv_position_check(self.positions["X"])
 
     def _auto_uv_position_check(self, x: float):
-        """向终点移动过程中，X 到达 UV 灯水平距离时开灯"""
-        if (self.auto_uv_var.get() and self._auto_active
-                and self._auto_leg == "end" and not self.uv_on
-                and x >= self._uv_dist):
+        """去程 X>=阈值开灯；回程 X<阈值关灯，回程绝不自动重开。"""
+        if not (self.auto_uv_var.get() and self._auto_active):
+            return
+        if self._auto_leg == "end" and x >= self._uv_dist:
             self._set_uv(True)
+        elif self._auto_leg in ("pass_return_home", "home") and x < self._uv_dist:
+            self._set_uv(False)
 
     def _auto_uv_toggled(self):
         """勾选框状态改变: 取消勾选立即关灯，勾选则按当前循环段应用"""
@@ -2820,8 +2841,10 @@ class MainWindow(tk.Tk):
             if self._encoder_active():
                 self._reset_workflow.position(x, received_at)
             else:
-                self._check_arrival()
+                # 先按收到 POS 时的运动段处理UV，再推进到位流程。
+                # 否则回程最后一帧可能直接启动下一PASS，遗漏本次关灯。
                 self._auto_uv_position_check(x)
+                self._check_arrival()
         self._post_ui(update)
 
     def _on_state_change(self, connected: bool, msg: str):

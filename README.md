@@ -60,12 +60,12 @@ X 轴速度在 `config.toml` 的 `[auto_cycle]` 中配置，取值为 1~100 的�
 
 ## 重置编码（手动维护）
 
-轴控制区三轴点动下方、预设按钮之前增加 **“重置编码”**。确认机械路径安全后点击一次，程序自动完成 **X=0 → MFC 硬件编码器复位 → X=-5**。不使用打印“暂停/恢复”，不使用固定 sleep 判断到位。日志和状态栏显示完成/中止结果；只有返程到位且 END 成功回复后才算完成。
+轴控制区三轴点动下方、预设按钮之前增加 **“重置编码”**。确认机械路径安全后点击一次，程序自动完成 **X 到配置的零点位置并确认停稳 → 向 MFC 发硬件复位指令 → 固定等待 2 秒 → X 回配置的起始位置**。目标分别来自 `config.toml` 的 `[auto_cycle].x_zero` 和 `x_home`，与界面“零点位置”/“起始位置”按钮相同，不写死为 `0` / `-5`。不使用打印“暂停/恢复”，不使用固定 sleep 判断到位；2 秒等待使用可取消的 UI 定时器，不阻塞界面。日志和状态栏显示完成/中止结果；只有返程到位且 END 成功回复后才算完成。
 
 ### 启动门禁与锁定
 
 - PLC 必须连接，且当前 PLC socket 已收到过有效 POS；MFC 必须连接并收到 `NETSCAN_SERVER_READY`。此首次 POS **仅作连接门禁，不能用于本次运动到位判断**。
-- 自动打印、任一轴 pending、未发送完的 PLC 队列、闪喷/压墨未完成、循环压墨或其他维护等待期间拒绝启动；X 配置行程必须同时包含 `0` 和 `-5`，否则不发送 BEGIN、不移动。
+- 自动打印、任一轴 pending、未发送完的 PLC 队列、闪喷/压墨未完成、循环压墨或其他维护等待期间拒绝启动；X 配置行程必须同时包含 `x_zero` 和 `x_home`，否则不发送 BEGIN、不移动。
 - 整个流程锁定 X/Y/Z、目标输入、点动步长、预设及设备相关参数/维护/自定义命令；重置按钮也加入 X 轴锁组，自动打印时不可按。**急停和事件区“停止”始终可用**，连接区可断开。主逻辑同样防止重入、手动运动和自定义命令覆盖目标。
 - 自定义命令缺少可靠的完成语义：正常发送仍保留，但发送原始 PLC/扫描命令后，会保守阻止重置编码，需先点“停止”清理；不要通过自定义命令调用编码器协议。
 
@@ -74,12 +74,12 @@ X 轴速度在 `config.toml` 的 `[auto_cycle]` 中配置，取值为 1~100 的�
 所有 MFC 消息使用 **ASCII + CRLF**、同一活跃 socket、一次流程一个正整数 TOKEN。TOKEN 单调递增且限制在 MFC 有符号 32 位 LONG 范围 `1..2147483647`，溢出在任何发送之前拒绝，不使用时间戳大整数：
 
 1. Python 发 `ENCODER_RESET_BEGIN TOKEN=n`，只预约维护。必须收到 `OK ENCODER_RESET_BEGIN TOKEN=n` 才允许运动；MFC 预约期间禁止启动打印。ERR（如 `BUSY/STOPPING/NOT_READY`）则取消，不能移动。
-2. Python 排队发送 PLC `X=0`。等待实际发送完成之后收到的**新 POS**，确认 `abs(X) <= POS_TOLERANCE`（默认 `0.1 mm`）；初始化的 `positions=0`、点击前缓存、发送前收到但延迟派发的 POS 都不能触发复位。
-3. Python 发 `RESET_ENCODER TOKEN=n`。MFC 执行原 `DEV_ResetPrinterEncValue(ZERO_POSITION)`，必须收到 `OK RESET_ENCODER TOKEN=n ENC=1048576` 才返程。`ERR ... REASON=...` 按原因文本兼容处理（包括 `BUSY/FAILED/NOT_RESERVED/STOPPING/NOT_READY/NOT_RESET/INVALID_TOKEN`）；错误或错误 ENC **绝不发送 X=-5**。
-4. 发送 PLC `X=-5`，同样等待实际发送之后的新 POS 到位，再发 `ENCODER_RESET_END TOKEN=n`；收到 `OK ENCODER_RESET_END TOKEN=n` 后完成解锁。**END ACK 超时同样按失败处理**。
+2. Python 排队发送 PLC `X=<x_zero>`。只使用实际发送之后收到的**新 POS**确认停稳：至少连续 3 帧、覆盖至少 500 ms；零点误差及窗口内坐标变化均不超过 `0.01 mm`（零点误差还受 `POS_TOLERANCE` 限制）。收到离开范围或坐标不稳定的反馈会重新累计；帧超过 1 秒未更新或消息已陈旧也不能沿用稳定窗口。PLC 协议没有独立的“运动已停止”状态位，因此这是基于位置反馈的停稳判定；没有持续新 POS 就不会复位。初始化坐标、点击前缓存、发送前反馈、重复/反序/过期反馈均不能替代停稳确认。
+3. Python 发 `RESET_ENCODER TOKEN=n`，MFC 按原协议执行 `DEV_ResetPrinterEncValue(ZERO_POSITION)`。**复位指令成功发送后，Python 从发送返回时刻起固定等待 2 秒，不等待 MFC 成功回复；已有 `OK RESET_ENCODER` 回复只兼容接收，不用于推进、不校验其中的 ENC，也不能缩短等待。** 未收到 OK 也会在 2 秒后继续。BEGIN/END 的预约/释放确认仍保留；若等待期间收到复位 ERR、发生断线、取消或停止则中止，不继续返程。
+4. 等待满 2 秒且原连接仍有效后，发送 PLC `X=<x_home>`，同样等待实际发送之后的新 POS 到位（默认容差 `0.1 mm`），再发 `ENCODER_RESET_END TOKEN=n`；收到 `OK ENCODER_RESET_END TOKEN=n` 后完成解锁。**END ACK 超时同样按失败处理**。
 5. 停止/断线/失败/超时会失活流程、撤销尚未发送的本次运动、取消定时器，并尽力用原 MFC socket 发 `ENCODER_RESET_CANCEL TOKEN=n`。MFC 幂等回复 `OK ENCODER_RESET_CANCEL TOKEN=n`；MFC socket 断开也会清除其预约。迟到/旧 TOKEN/旧 socket 的回包不触发移动。
 
-运动阶段超时默认 **30 秒**，BEGIN/RESET/END ACK 默认 **5 秒**（`encoder_reset.py` 常量及构造参数；测试可注入 fake clock/调度器）。只有**本流程确实下发过 X 运动**（发送失败时可能已部分下发也保守计入）才因维护取消发送 `q`；BEGIN 拒绝/超时或尚未发送运动时不发 `q`，避免误停刚获得打印权限的任务。用户显式点击急停/停止仍保留原本立即 `q` 的含义。
+运动阶段超时默认 **30 秒**（含零点停稳确认），BEGIN/END ACK 默认 **5 秒**；复位后为固定 **2 秒**等待，不是 RESET ACK 超时（`encoder_reset.py` 常量及构造参数；测试可注入 fake clock/调度器）。只有**本流程确实下发过 X 运动**（发送失败时可能已部分下发也保守计入）才因维护取消发送 `q`；BEGIN 拒绝/超时或尚未发送运动时不发 `q`，避免误停刚获得打印权限的任务。用户显式点击急停/停止仍保留原本立即 `q` 的含义。
 
 ### 同时点击 MFC 开始与重置
 
@@ -98,7 +98,7 @@ X 轴速度在 `config.toml` 的 `[auto_cycle]` 中配置，取值为 1~100 的�
 
 除上述同步撤销 Event 外，网络线程只向 Python 队列写回调；全部 Tk 更新、状态机推进和定时器清理由主线程处理。
 
-> 网络故障时 `q`/CANCEL 都只能尽力发送，不能替代硬件急停。取消不代表机械已回零或编码已恢复；检查实际坐标和设备状态后再重试。若 CANCEL 未送达且 MFC 仍占用预约，可断开 MFC 通道释放；不要绕过门禁强行打印。
+> 网络故障时 `q`/CANCEL 都只能尽力发送，不能替代硬件急停。取消不代表机械已回零或编码已恢复；检查实际坐标和设备状态后再重试。固定 2 秒从 Python 发完复位指令起计算，不是硬件执行完成证明，也没有验证编码器实际读数。若 CANCEL 未送达且 MFC 仍占用预约，可断开 MFC 通道释放；不要绕过门禁强行打印。
 
 ## 服务器驱动打印流程
 
@@ -176,8 +176,7 @@ flowchart TD
     UVON -- 否 --> UVON
     END --> ZERO[X 到达 x_end 即视为 PASS 完成<br/>不等待 PASS_REMAINING_ZERO]
     LAMPON --> UVARRIVE[等待 X 到达 x_end_withuv]
-    UVARRIVE --> LAMPOFF[关闭 UV 灯]
-    LAMPOFF --> ZERO_UV[关闭 UV 后视为 PASS 完成<br/>不发送急停]
+    UVARRIVE --> ZERO_UV[终点保持 UV 开启，PASS 运动完成<br/>不发送急停]
     ZERO_UV --> COUNT
     ZERO --> COUNT[闪喷计数 +1<br/>界面显示计数]
     COUNT --> FLASH_DUE{启用维护闪喷 且<br/>闪喷计数 ≥ flash.interval?}
@@ -187,7 +186,7 @@ flowchart TD
     XOFFSET_WAIT --> STOP_WAIT[按 config.toml 配置等待]
     FLASH_DUE -- 否 --> STOP_WAIT
     STOP_WAIT --> XHOME[移动 X 到起始位置 X_HOME]
-    XHOME --> XHOME_WAIT[等待 X 到位]
+    XHOME --> XHOME_WAIT[等待 X 到位<br/>自动UV: 回程 X 小于 uv_offset 时关灯]
     XHOME_WAIT --> PASS_DONE{CURRENT < TOTAL?}
     PASS_DONE -- 是 --> WAIT_PASS
     PASS_DONE -- 否 --> LISTEN
@@ -237,7 +236,7 @@ flowchart TD
 | `[auto_cycle] x_home / x_end` | X 轴往返端点 |
 | `[auto_cycle] y_home` | prehome 阶段 X 到位后，Y 移动到的起始位置 |
 | `[auto_cycle] x_end_withuv` | 自动 UV 开启时 PASS 使用的 X 终点 |
-| `[auto_cycle] uv_offset` | 自动 UV 开启阈值；X 达到该位置时开灯，默认 `120 mm` |
+| `[auto_cycle] uv_offset` | 自动 UV 开关阈值；去程 X ≥ 此位置时开灯，回程 X < 此位置时关灯，默认 `120 mm` |
 | `[auto_cycle] pass_stop_wait_seconds` | PASS 到达 X 终点后的等待时间（秒） |
 | `[z_step] layers / step` | 打印层数每达到 `layers` 的倍数下降 `step` mm |
 | `[flash] interval` | 维护闪喷间隔，即累计多少次 X 循环/急停后执行一次维护闪喷；仅通过配置文件设置，UI 不提供输入框；必须为正整数，默认 `10` |
@@ -251,8 +250,9 @@ flowchart TD
 ### 自动 UV 灯（可选）
 
 - 自动 UV 关闭时，PASS 使用 `x_end`，X 到达终点即完成，不发送 `q` 急停。
-- 自动 UV 开启时，PASS 使用 `x_end_withuv`；X ≥ `[auto_cycle] uv_offset` 时开灯，X 到达终点后关灯并完成 PASS，不等待 `PASS_REMAINING_ZERO`。其余运动段一律关灯。
-- 停止/中止/急停/断开时自动关灯。
+- 自动 UV 开启时，PASS 使用 `x_end_withuv`；去程 X ≥ `[auto_cycle] uv_offset` 时开灯，到达终点不关灯，也不等待 `PASS_REMAINING_ZERO`。终点等待、维护闪喷及回程前半段保持已开启的灯，直到回程 X < 同一阈值时关闭；等于阈值时仍保持开启，回程不会自动重新开灯。其他运动段保持关灯。
+- 例如阈值为 `100 mm`：去程到 `X=100` 开灯，终点继续亮，回程降至 `X<100` 后关灯。
+- 停止/中止/急停、任务完成或取消“自动UV灯”时仍按原逻辑请求关灯；网络断开后不能保证设备实际已关灯，需确认设备状态，必要时使用硬件急停。
 
 ## 无硬件测试
 

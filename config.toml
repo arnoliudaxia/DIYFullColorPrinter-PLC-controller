@@ -29,7 +29,7 @@ x_end_withuv = 220.0
 x_speed_outbound = 100
 x_speed_return = 100
 # 自动 UV 灯开启的 X 轴水平偏移 (mm)
-uv_offset = 120.0
+uv_offset = 100.0
 # 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
 pass_stop_wait_seconds = 0.3
 # 自动流程中发送 Y 运动指令后的到位超时时间 (ms)。
