@@ -924,6 +924,8 @@ class MainWindow(tk.Tk):
         self._auto_active = False
         # 暂停只阻止下一动作，不中断已经发出的运动或正在进行的等待。
         self._workflow_paused = False
+        self._pause_motion_unlocked = False
+        self._paused_layer_start = None
         self._prehome_pending_start = False
         self._auto_mode = None       # 当前任务来源: "manual" / "server"
         self._auto_remaining = 0   # 本组内剩余循环次数
@@ -1119,6 +1121,11 @@ class MainWindow(tk.Tk):
             reset_row, text="重置编码", command=self._start_encoder_reset)
         self.encoder_reset_btn.pack(side="left", padx=4)
         self.axis_widgets["X"].append(self.encoder_reset_btn)
+        self.device_reset_btn = ttk.Button(
+            reset_row, text="复位", command=self._send_device_reset)
+        self.device_reset_btn.pack(side="left", padx=4)
+        for axis in AXIS_LIMITS:
+            self.axis_widgets[axis].append(self.device_reset_btn)
 
         # 快捷位置按钮（X / Z 各一行）
         quick_x = ttk.Frame(frame)
@@ -1359,11 +1366,16 @@ class MainWindow(tk.Tk):
         """发送闪喷命令 FLASH\r\n 到扫描服务器"""
         if self._encoder_active():
             return
+        if (self._auto_active and self._workflow_paused and not self.flash_on
+                and (self._pending or not self.sender.idle)):
+            self._append_log("[闪喷] 拒绝开启：暂停中的运动尚未完成\n")
+            return
         if not self.scan.connected:
             messagebox.showwarning("提示", "扫描服务器未连接")
             return
         if self.scan.send(f"{CMD_FLASH}\r\n"):
             self._maintenance_pending.add("FLASH")
+            self._refresh_pause_motion_lock()
             self._append_log(f"[闪喷] 发送: {CMD_FLASH}\r\n")
 
     def _select_press_ink_time(self):
@@ -1380,6 +1392,12 @@ class MainWindow(tk.Tk):
                 self._emergency_stop()
             else:
                 self._append_log("[重置编码] 维护期间拒绝自定义命令\n")
+            return
+        if self._auto_active:
+            if cmd.lower() == CMD_ESTOP:
+                self._emergency_stop()
+            else:
+                self._append_log("[自定义] 自动任务期间请使用暂停后的轴控件，拒绝原始命令\n")
             return
         if any(word in cmd.upper() for word in ("ENCODER_RESET", "RESET_ENCODER")):
             self._append_log("[重置编码] 请使用重置编码按钮，不允许绕过维护协议\n")
@@ -1414,6 +1432,7 @@ class MainWindow(tk.Tk):
             bg="#2e86de" if enabled else "#f0f0f0",
             fg="white" if enabled else "black",
             activebackground="#9ec7f0" if enabled else "#d9d9d9")
+        self._refresh_pause_motion_lock()
 
     def _toggle_press_ink_repeat(self):
         if self._encoder_active():
@@ -1447,6 +1466,12 @@ class MainWindow(tk.Tk):
         """发送压墨命令；循环开启时，在成功发送后安排下一次压墨。"""
         if self._encoder_active():
             return
+        if (self._auto_active and self._workflow_paused
+                and (self._pending or not self.sender.idle)):
+            if repeated:
+                self._set_press_ink_repeat(False)
+            self._append_log("[压墨] 拒绝：暂停中的运动尚未完成\n")
+            return
         if not self.scan.connected:
             if repeated:
                 self._set_press_ink_repeat(False)
@@ -1457,6 +1482,7 @@ class MainWindow(tk.Tk):
         seconds = self.press_ink_seconds
         if self.scan.send(f"PRESS_INK {fmt_pos(seconds)}\r\n"):
             self._maintenance_pending.add("PRESS_INK")
+            self._refresh_pause_motion_lock()
             source = "循环" if repeated else "手动"
             self._append_log(f"[压墨] {source}发送: PRESS_INK {fmt_pos(seconds)}\r\n")
             self._schedule_press_ink_repeat(seconds)
@@ -1511,37 +1537,15 @@ class MainWindow(tk.Tk):
             if m:
                 layer = int(m.group(1))
                 self._append_log(f"[图层] LAYER_START LAYER={layer}\n")
-                if (self._auto_active and self._auto_mode == "server"):
-                    # 新层事件优先级最高：丢弃上一层残留 PASS/ZERO，
-                    # 立即切换到当前层定位流程。
-                    self._pending.clear()
-                    self._cancel_all_axis_retries()
-                    self._auto_leg = "wait_layer"
-                    # 新层抢占已离开UV保持段，即使暂停阻止定位也要先关灯。
-                    self._auto_uv_update()
-                    self.event_queue = deque(
-                        (ts, ev) for ts, ev in self.event_queue
-                        if not (PASS_READY_PATTERN.fullmatch(ev)
-                                or PASS_REMAINING_ZERO_PATTERN.fullmatch(ev))
-                    )
-                    self.event_list.delete(0, "end")
-                    for ts, ev in self.event_queue:
-                        self.event_list.insert("end", f"[{ts}] {ev}")
-                    self.event_count_var.set(f"{len(self.event_queue)} 条")
-                    if 1 <= layer <= self._job_total_layers:
-                        self._job_current_layer = layer
-                        self._update_job_progress()
-                        if layer == self._job_total_layers:
-                            self._layer_listening = False
-                            self._append_log(
-                                f"[图层] 已监听到最后一层 {layer}/"
-                                f"{self._job_total_layers}\n")
-                    else:
-                        self._append_log(
-                            f"[图层] LAYER={layer} 超出任务总层数 "
-                            f"{self._job_total_layers}，忽略进度更新\n")
-                # 立即消费当前层并执行 Z/Y 定位，不受上一层状态影响
-                self._try_start_layer(layer)
+                if self._auto_active and (
+                        self._workflow_paused or self._paused_layer_start is not None
+                        or self._flash_pausing or self._flash_wait_off
+                        or self._flash_after is not None or self._flash_wait_after is not None
+                        or self._server_stop_after is not None):
+                    self._paused_layer_start = layer
+                    self._append_log("[自动] 已保留新层事件，当前运动/暂停/维护结束后再切换\n")
+                    return
+                self._accept_layer_start(layer)
                 return
             m = PASS_READY_PATTERN.match(line.strip())
             if m:
@@ -1564,6 +1568,7 @@ class MainWindow(tk.Tk):
                 if re.fullmatch(r"OK PRESS_INK SECONDS=\d+(?:\.\d+)? "
                                 r"RESULT=\w+ STATE=OFF", line.strip()):
                     self._maintenance_pending.discard("PRESS_INK")
+                    self._refresh_pause_motion_lock()
                 # 接受回复不能当成完成；仅确认最终 OFF 后解除维护门禁。
                 self._append_log(f"[压墨] {line}\n")
                 return
@@ -1574,6 +1579,7 @@ class MainWindow(tk.Tk):
                 self.flash_on = after == "ON"
                 self.flash_btn.config(text=f"闪喷: {'开' if self.flash_on else '关'}")
                 self._append_log(f"[闪喷] 状态: {before} -> {after}\n")
+                self._refresh_pause_motion_lock()
                 if self._flash_wait_off and not self.flash_on:
                     # 结束闪喷已确认关闭，继续移动 X
                     if self._flash_wait_after is not None:
@@ -1582,11 +1588,52 @@ class MainWindow(tk.Tk):
                     self._flash_wait_off = False
                     self._append_log("[自动] 闪喷已结束，继续自动循环\n")
                     self._proceed_after_flash()
+                elif not self.flash_on and self._paused_layer_start is not None:
+                    # 关闭确认可能晚于超时；确认关闭后才能接管延迟新层。
+                    self._resume_workflow()
             elif FLASH_ACCEPTED in line:
                 self._append_log(f"[闪喷] 已接受: {FLASH_ACCEPTED}\n")
             elif line.startswith("未知命令"):
                 self._append_log(f"[闪喷] 未知命令回复: {line}\n")
         self._post_ui(update)
+
+    def _accept_layer_start(self, layer):
+        self._paused_layer_start = None
+        if (self._auto_active and self._auto_mode == "server"):
+            # 新层事件优先级最高：丢弃上一层残留 PASS/ZERO，
+            # 立即切换到当前层定位流程。
+            self._pending.clear()
+            self._cancel_all_axis_retries()
+            self._auto_leg = "wait_layer"
+            self._auto_uv_update()
+            # 延后消费新层时，只清其到达之前的旧PASS；保留暂停期间后续的新PASS。
+            queued = list(self.event_queue)
+            boundary = max((i for i, (_, ev) in enumerate(queued)
+                            if ev == f"EVENT LAYER_START LAYER={layer}"), default=len(queued))
+            self.event_queue = deque(
+                (ts, ev) for i, (ts, ev) in enumerate(queued)
+                if i >= boundary or not (PASS_READY_PATTERN.fullmatch(ev)
+                                         or PASS_REMAINING_ZERO_PATTERN.fullmatch(ev)
+                                         or LAYER_START_PATTERN.fullmatch(ev))
+            )
+            self.event_list.delete(0, "end")
+            for ts, ev in self.event_queue:
+                self.event_list.insert("end", f"[{ts}] {ev}")
+            self.event_count_var.set(f"{len(self.event_queue)} 条")
+            if 1 <= layer <= self._job_total_layers:
+                self._job_current_layer = layer
+                self._update_job_progress()
+                if layer == self._job_total_layers:
+                    self._layer_listening = False
+                    self._append_log(
+                        f"[图层] 已监听到最后一层 {layer}/"
+                        f"{self._job_total_layers}\n")
+            else:
+                self._append_log(
+                    f"[图层] LAYER={layer} 超出任务总层数 "
+                    f"{self._job_total_layers}，忽略进度更新\n")
+        # 立即消费当前层并执行 Z/Y 定位，不受上一层状态影响
+        self._try_start_layer(layer)
 
     # ---------- 编码器维护（独立于打印/暂停状态机） ----------
 
@@ -1715,6 +1762,26 @@ class MainWindow(tk.Tk):
 
     # ---------- 轴控制 ----------
 
+    def _send_device_reset(self):
+        """发送设备原始复位指令，不替换为三条轴运动或MFC编码器复位。"""
+        if self._closing:
+            return
+        if (self._encoder_active() or self._auto_active or self._pending
+                or self._maintenance_pending or self.flash_on
+                or self._press_ink_repeat_enabled or self._press_ink_repeat_after is not None
+                or self._flash_pausing or self._flash_wait_off
+                or self._flash_after is not None or self._flash_wait_after is not None
+                or self._server_stop_after is not None or not self.sender.idle):
+            self._append_log("[复位] 拒绝：打印/运动/维护任务正忙\n")
+            return
+        if not self.sender.connected or self.sender.sock is None:
+            self._append_log("[复位] 拒绝：PLC 未连接\n")
+            self.status_var.set("PLC 未连接，未发送复位指令")
+            return
+        if self.sender.send_command("xyz=0"):
+            self._append_log("[复位] 设备指令 xyz=0 已加入发送队列，请以设备反馈为准\n")
+            self.status_var.set("复位指令 xyz=0 已加入发送队列，执行结果以设备反馈为准")
+
     def _check_range(self, axis: str, target: float) -> bool:
         lo, hi = AXIS_LIMITS[axis]
         if not (lo <= target <= hi):
@@ -1724,8 +1791,18 @@ class MainWindow(tk.Tk):
             return False
         return True
 
+    def _manual_motion_allowed(self, axis: str) -> bool:
+        if self._closing or self._encoder_active() or axis in self._pending:
+            return False
+        if not self.sender.connected:
+            return False
+        if self._auto_active and not self._pause_motion_available():
+            self._append_log("[运动] 自动流程运行中或当前动作未结束，请暂停并等待到位\n")
+            return False
+        return True
+
     def _move_absolute(self, axis: str):
-        if self._encoder_active():
+        if not self._manual_motion_allowed(axis):
             return
         try:
             target = float(self.target_vars[axis].get().strip())
@@ -1739,7 +1816,7 @@ class MainWindow(tk.Tk):
 
     def _move_to(self, axis: str, target: float):
         """移动到指定绝对位置（快捷按钮用）"""
-        if self._encoder_active():
+        if not self._manual_motion_allowed(axis):
             return
         if not self._check_range(axis, target):
             return
@@ -1747,7 +1824,7 @@ class MainWindow(tk.Tk):
         self._wait_target(axis, target)
 
     def _jog(self, axis: str, direction: int):
-        if self._encoder_active():
+        if not self._manual_motion_allowed(axis):
             return
         try:
             step = abs(float(self.step_var.get().strip()))
@@ -1774,7 +1851,8 @@ class MainWindow(tk.Tk):
         # If the axis is already at the requested target, some devices do not
         # emit a subsequent status frame.  Advance immediately so the
         # automatic workflow cannot remain stuck waiting for arrival.
-        if self._auto_active and abs(self.positions.get(axis, target) - target) <= POS_TOLERANCE:
+        if (self._auto_active and not self._workflow_paused
+                and abs(self.positions.get(axis, target) - target) <= POS_TOLERANCE):
             self._pending.pop(axis, None)
             self._cancel_axis_retry(axis)
             self._auto_advance()
@@ -1782,6 +1860,9 @@ class MainWindow(tk.Tk):
             return
         self._pending[axis] = target
         self._set_axis_enabled(axis, False)
+        if self._auto_active and self._workflow_paused:
+            self._refresh_pause_motion_lock()
+            self.status_var.set(f"已暂停：手动移动 {axis}，到位后可继续操作或恢复")
         if not self._auto_active:
             self.status_var.set(f"{axis} 轴运动中... 到达目标位置后才能再次操作该轴")
         if retry_timeout_ms:
@@ -1827,6 +1908,15 @@ class MainWindow(tk.Tk):
         state = "normal" if enabled else "disabled"
         for w in self.axis_widgets[axis]:
             w.config(state=state)
+        # 复位按钮属于三轴：单轴到位不能在其他轴仍运动时提前解锁它。
+        encoder_btn = getattr(self, "encoder_reset_btn", None)
+        if encoder_btn is not None and self._auto_active:
+            encoder_btn.config(state="disabled")
+        reset_btn = getattr(self, "device_reset_btn", None)
+        if reset_btn is not None:
+            reset_enabled = (enabled and not self._pending and not self._auto_active
+                             and not self._encoder_active())
+            reset_btn.config(state="normal" if reset_enabled else "disabled")
 
     def _set_auto_widgets(self, enabled: bool):
         state = "normal" if enabled else "disabled"
@@ -1842,7 +1932,7 @@ class MainWindow(tk.Tk):
 
     def _unlock_auto_group(self):
         for axis in AXIS_LIMITS:
-            self._set_axis_enabled(axis, True)
+            self._set_axis_enabled(axis, axis not in self._pending)
         self._set_auto_widgets(True)
 
     def _unlock_all(self):
@@ -1859,10 +1949,14 @@ class MainWindow(tk.Tk):
         for a in arrived:
             del self._pending[a]
             self._cancel_axis_retry(a)
+        if self._auto_active and self._workflow_paused:
+            # 自动到位及暂停中的手动到位都只解锁，不推进保留的自动流程段。
+            self._refresh_pause_motion_lock()
+            return
         if not arrived:
             return
         if self._auto_active:
-            # 自动循环期间 X/Y/Z 三轴全部锁定，到达后不单独解锁
+            # 非暂停期间 X/Y/Z 三轴全部锁定，到达后不单独解锁
             if not self._pending:
                 if arrived:
                     self._append_log(
@@ -1900,16 +1994,48 @@ class MainWindow(tk.Tk):
         self.pass_progress_var.set(
             f"PASS进度: {self._pass_current}/{self._pass_total}")
 
+    def _pause_motion_available(self) -> bool:
+        """等当前自动动作/维护及队列结束，才允许暂停中的手动运动。"""
+        return (self._auto_active and self._workflow_paused
+                and not self._encoder_active() and not self._pending
+                and self.sender.idle and not self._maintenance_pending
+                and not self.flash_on and not self._press_ink_repeat_enabled
+                and self._press_ink_repeat_after is None
+                and not self._flash_pausing and not self._flash_wait_off
+                and self._flash_after is None and self._flash_wait_after is None
+                and self._server_stop_after is None)
+
+    def _refresh_pause_motion_lock(self):
+        if not (self._auto_active and self._workflow_paused):
+            return
+        available = self._pause_motion_available()
+        if available and not self._pause_motion_unlocked:
+            self._pause_motion_unlocked = True
+            # 进入手动调整阶段后关闭自动UV；手动运动不能按打印段重新点亮。
+            if self.auto_uv_var.get():
+                self._set_uv(False)
+            self._append_log("[暂停] 当前动作已结束，已解除移动/点动/预设锁定\n")
+        for axis in AXIS_LIMITS:
+            self._set_axis_enabled(axis, available)
+        self.status_var.set(
+            "已暂停：可手动移动，完成调整后点击恢复"
+            if available else "已暂停：等待当前运动/维护结束，暂不解锁运动")
+
     def _defer_next_action(self) -> bool:
         """暂停时保留当前流程段，等用户恢复后再推进下一动作。"""
         if not self._workflow_paused:
             return False
-        self.status_var.set("已暂停：下一动作等待恢复")
+        if self._auto_active:
+            self._refresh_pause_motion_lock()
+        else:
+            self.status_var.set("已暂停：下一动作等待恢复")
         return True
 
     def _reset_workflow_pause(self):
         """停止、完成或断开时清除暂停状态。"""
         self._workflow_paused = False
+        self._pause_motion_unlocked = False
+        self._paused_layer_start = None
         self.pause_btn.config(text="暂停")
 
     def _toggle_workflow_pause(self):
@@ -1917,15 +2043,41 @@ class MainWindow(tk.Tk):
             return
         if not self._workflow_paused:
             self._workflow_paused = True
+            self._pause_motion_unlocked = False
             self.pause_btn.config(text="恢复")
-            self.status_var.set("已请求暂停：当前动作继续，下一动作等待恢复")
-            self._append_log("[暂停] 当前动作继续执行，下一动作将等待恢复\n")
+            self.status_var.set("已请求暂停：当前动作继续，结束后允许手动移动")
+            self._append_log("[暂停] 当前动作继续执行，结束后解锁运动，下一动作等待恢复\n")
+            self._refresh_pause_motion_lock()
+            return
+        if self._auto_active and (self._pending or not self.sender.idle
+                                  or self._maintenance_pending
+                                  or self._press_ink_repeat_enabled
+                                  or self._press_ink_repeat_after is not None
+                                  or (self.flash_on and not self._flash_pausing
+                                      and not self._flash_wait_off)):
+            self.status_var.set("仍有运动/指令/维护未完成，请等待结束后再点击恢复")
+            self._append_log("[暂停] 暂不能恢复：请等待当前运动及指令完成，并结束手动维护\n")
             return
         self._workflow_paused = False
+        self._pause_motion_unlocked = False
         self.pause_btn.config(text="暂停")
-        self.status_var.set("已恢复，继续执行后续动作")
+        if self._auto_active:
+            for axis in AXIS_LIMITS:
+                self._set_axis_enabled(axis, False)
+        self.status_var.set("已恢复，运动重新锁定，继续执行后续动作")
         self._append_log("[暂停] 已恢复，继续执行后续动作\n")
         self._resume_workflow()
+
+    def _consume_paused_layer_start(self) -> bool:
+        """单向消费延迟新层，避免恢复/维护完成分派之间互相递归。"""
+        if (self._paused_layer_start is None or self._workflow_paused
+                or self._pending or self._flash_pausing or self._flash_wait_off
+                or self.flash_on or self._flash_after is not None
+                or self._flash_wait_after is not None or self._server_stop_after is not None):
+            return False
+        layer, self._paused_layer_start = self._paused_layer_start, None
+        self._accept_layer_start(layer)
+        return True
 
     def _resume_workflow(self):
         """按保留的流程段恢复；尚未完成的当前动作不作重复推进。"""
@@ -1934,6 +2086,10 @@ class MainWindow(tk.Tk):
         if (self._pending or self._flash_after is not None
                 or self._flash_wait_after is not None
                 or self._server_stop_after is not None):
+            return
+        if (self._paused_layer_start is not None and not self._flash_pausing
+                and not self._flash_wait_off):
+            self._consume_paused_layer_start()
             return
         leg = self._auto_leg
         if leg == "prehome":
@@ -1977,10 +2133,15 @@ class MainWindow(tk.Tk):
             self._abort_encoder_reset("START_JOB 与维护冲突")
             if not before_reservation:
                 return
+        if self._workflow_paused and (self._pending or not self.sender.idle):
+            self._append_log("[自动] 拒绝 START_JOB：暂停中的运动/发送队列尚未结束\n")
+            return
         # 每次 START_JOB 都视为新任务，清空上一任务的队列、目标和定时器。
         self._pending.clear()
         self._cancel_all_axis_retries()
         self._cancel_flash_pause()
+        self._pause_motion_unlocked = False
+        self._paused_layer_start = None
         self.event_queue.clear()
         self.event_list.delete(0, "end")
         self.event_count_var.set("0 条")
@@ -2012,6 +2173,8 @@ class MainWindow(tk.Tk):
 
     def _complete_server_job(self):
         """收到服务端 PRINT_JOB_COMPLETED 后清理任务，并清空 Y 初始位置。"""
+        manual_pending = (dict(self._pending)
+                          if self._workflow_paused and self._pause_motion_unlocked else {})
         self._auto_active = False
         self._auto_mode = None
         self._auto_leg = "complete"
@@ -2030,6 +2193,8 @@ class MainWindow(tk.Tk):
         self.event_count_var.set("0 条")
         self._cancel_flash_pause()
         self._reset_workflow_pause()
+        # 打印完成不等于用户刚刚下发的手动运动已到位。
+        self._pending.update(manual_pending)
         self.event_queue.clear()
         self.event_list.delete(0, "end")
         self.event_count_var.set("0 条")
@@ -2193,8 +2358,9 @@ class MainWindow(tk.Tk):
     def _flash_resume(self):
         """闪喷暂停结束：若闪喷仍开启则先发送结束命令，确认关闭后再移动 X"""
         self._flash_after = None
-        if not self._auto_active or self._defer_next_action():
+        if not self._auto_active:
             return
+        # 暂停不阻止结束已开启的闪喷；只在后续运动入口等待恢复。
         self._flash_pausing = False
         if self.flash_on:
             self._flash_wait_off = True
@@ -2208,6 +2374,9 @@ class MainWindow(tk.Tk):
     def _proceed_after_flash(self):
         """结束闪喷确认后，按手动/服务端任务类型继续对应流程。"""
         if not self._auto_active or self._defer_next_action():
+            return
+        if self._paused_layer_start is not None:
+            self._consume_paused_layer_start()
             return
         if (self._auto_mode == "server"
                 and self._auto_leg == "server_flash_pause"):
@@ -2489,6 +2658,9 @@ class MainWindow(tk.Tk):
         self._append_log(
             f"[自动] PASS 终点后等待 {fmt_pos(PASS_STOP_WAIT_SECONDS)} 秒完成，"
             "继续 PASS 流程\n")
+        if self._paused_layer_start is not None:
+            self._consume_paused_layer_start()
+            return
         self._finish_server_pass()
 
     def _try_start_layer(self, received_layer=None):
@@ -2757,6 +2929,8 @@ class MainWindow(tk.Tk):
     def _auto_uv_position_check(self, x: float):
         """去程 X>=阈值开灯；回程 X<阈值关灯，回程绝不自动重开。"""
         if not (self.auto_uv_var.get() and self._auto_active):
+            return
+        if self._workflow_paused and self._pause_motion_unlocked:
             return
         if self._auto_leg == "end" and x >= self._uv_dist:
             self._set_uv(True)

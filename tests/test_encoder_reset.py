@@ -701,6 +701,7 @@ class IntegrationTests(unittest.TestCase):
                         _flash_after=None, _flash_wait_after=None, _server_stop_after=None,
                         positions={"X": 0, "Y": 0, "Z": 0}, _closing=False,
                         _ui_queue=queue.Queue(), _workflow_paused=False,
+                        _pause_motion_unlocked=False, _paused_layer_start=None,
                         auto_uv_var=mock.Mock(get=lambda: False))
         for key, value in defaults.items():
             setattr(w, key, value)
