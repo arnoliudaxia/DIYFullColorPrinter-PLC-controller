@@ -26,8 +26,8 @@ x_end = 200.0
 x_end_withuv = 220.0
 # X 轴速度：去程为起始位置到终点，来程为终点返回起始位置
 # 代码只要求 >= 1，上限由设备约束
-x_speed_outbound = 100
-x_speed_return = 100
+x_speed_outbound = 120
+x_speed_return = 120
 # 自动 UV 灯开启的 X 轴水平偏移 (mm)
 uv_offset = 100.0
 # 收到匹配的 PASS_REMAINING_ZERO 并发送 q 急停后的等待时间 (秒)
@@ -69,7 +69,7 @@ wait_timeout_ms = 5000
 # press_z: Z 轴预设"压墨高度" (mm)，点击 Z 轴预设按钮移动到该高度
 [press_ink]
 z_drop = 80.0
-durations = [2, 5, 10]
+durations = [5, 10]
 press_z = 70.0
 
 # Z 轴预设按钮高度 (mm)
