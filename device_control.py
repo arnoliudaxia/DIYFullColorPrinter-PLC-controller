@@ -1085,17 +1085,17 @@ class MainWindow(tk.Tk):
         self.target_vars = {}
 
         for row, axis in enumerate(AXIS_LIMITS, start=2):
-            ttk.Label(frame, text=axis, font=("", 10, "bold")).grid(row=row, column=0, padx=4)
+            ttk.Label(frame, text=axis, font=("", 10, "bold")).grid(row=row, column=0, padx=4, pady=4)
 
             lbl = ttk.Label(frame, text="0", width=10, anchor="center", relief="groove")
-            lbl.grid(row=row, column=1, padx=4)
+            lbl.grid(row=row, column=1, padx=4, pady=4)
             self.pos_labels[axis] = lbl
 
             self.target_vars[axis] = tk.StringVar(value="0")
-            ttk.Entry(frame, textvariable=self.target_vars[axis], width=8).grid(row=row, column=2, padx=2)
+            ttk.Entry(frame, textvariable=self.target_vars[axis], width=8).grid(row=row, column=2, padx=2, pady=4)
             move_btn = ttk.Button(frame, text="移动", width=6,
                                   command=lambda a=axis: self._move_absolute(a))
-            move_btn.grid(row=row, column=3, padx=4)
+            move_btn.grid(row=row, column=3, padx=4, pady=4)
             self.axis_widgets[axis].append(move_btn)
 
             jog_minus = ttk.Button(frame, text=JOG_LABELS[axis][0], width=6,
@@ -1104,19 +1104,19 @@ class MainWindow(tk.Tk):
                                   command=lambda a=axis: self._jog(a, 1))
             if axis == "X":
                 # X 轴点动先显示"左"再"右"（与视觉方向一致）
-                jog_plus.grid(row=row, column=4, padx=2)
-                jog_minus.grid(row=row, column=5, padx=2)
+                jog_plus.grid(row=row, column=4, padx=2, pady=4)
+                jog_minus.grid(row=row, column=5, padx=2, pady=4)
             else:
-                jog_minus.grid(row=row, column=4, padx=2)
-                jog_plus.grid(row=row, column=5, padx=2)
+                jog_minus.grid(row=row, column=4, padx=2, pady=4)
+                jog_plus.grid(row=row, column=5, padx=2, pady=4)
             self.axis_widgets[axis] += [jog_minus, jog_plus]
 
             lo, hi = AXIS_LIMITS[axis]
             ttk.Label(frame, text=f"[{fmt_pos(lo)}, {fmt_pos(hi)}]",
-                      foreground="gray").grid(row=row, column=6, padx=6)
+                      foreground="gray").grid(row=row, column=6, padx=6, pady=4)
 
         reset_row = ttk.Frame(frame)
-        reset_row.grid(row=5, column=0, columnspan=7, sticky="w", pady=2)
+        reset_row.grid(row=5, column=0, columnspan=7, sticky="w", pady=5)
         self.encoder_reset_btn = ttk.Button(
             reset_row, text="重置编码", command=self._start_encoder_reset)
         self.encoder_reset_btn.pack(side="left", padx=4)
@@ -1129,7 +1129,7 @@ class MainWindow(tk.Tk):
 
         # 快捷位置按钮（X / Z 各一行）
         quick_x = ttk.Frame(frame)
-        quick_x.grid(row=6, column=0, columnspan=7, sticky="w", pady=2)
+        quick_x.grid(row=6, column=0, columnspan=7, sticky="w", pady=5)
         ttk.Label(quick_x, text="X 轴预设:").pack(side="left", padx=4)
         for text, target in [(f"零点位置 ({fmt_pos(X_ZERO)})", X_ZERO),
                              (f"起始位置 ({fmt_pos(X_HOME)})", X_HOME),
@@ -1140,7 +1140,7 @@ class MainWindow(tk.Tk):
             self.axis_widgets["X"].append(b)
 
         quick_z = ttk.Frame(frame)
-        quick_z.grid(row=7, column=0, columnspan=7, sticky="w", pady=2)
+        quick_z.grid(row=7, column=0, columnspan=7, sticky="w", pady=5)
         ttk.Label(quick_z, text="Z 轴预设:").pack(side="left", padx=4)
         for text, target in [(f"打印高度 ({fmt_pos(PRINT_Z)})", PRINT_Z),
                              ("调试高度 (-10)", -10),
@@ -1151,15 +1151,28 @@ class MainWindow(tk.Tk):
             b.pack(side="left", padx=4)
             self.axis_widgets["Z"].append(b)
 
+        # X 轴独立往复循环：每次循环为 X_HOME -> X_END -> X_HOME。
+        x_loop_row = ttk.Frame(frame)
+        x_loop_row.grid(row=8, column=0, columnspan=7, sticky="w", pady=5)
+        ttk.Label(x_loop_row, text="X往复次数:").pack(side="left", padx=4)
+        self.x_loop_count_var = tk.StringVar(value="1")
+        x_loop_count_entry = ttk.Entry(
+            x_loop_row, textvariable=self.x_loop_count_var, width=8)
+        x_loop_count_entry.pack(side="left", padx=2)
+        self.x_loop_btn = ttk.Button(
+            x_loop_row, text="开始X循环移动", command=self._toggle_x_loop)
+        self.x_loop_btn.pack(side="left", padx=6)
+        self.auto_widgets += [x_loop_count_entry, self.x_loop_btn]
+
         # 服务器事件驱动流程的计数显示。
         self.cycle_info_var = tk.StringVar(value="")
         self.eta_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.auto_count_var,
-                  foreground="#1565c0").grid(row=8, column=0, columnspan=7, pady=8)
+                  foreground="#1565c0").grid(row=9, column=0, columnspan=7, pady=8)
 
         self.last_report_var = tk.StringVar(value="等待设备上报...")
         ttk.Label(frame, textvariable=self.last_report_var,
-                  foreground="gray").grid(row=9, column=0, columnspan=7, pady=6)
+                  foreground="gray").grid(row=10, column=0, columnspan=7, pady=6)
 
     def _build_event_frame(self, parent):
         """socket EVENT 主动事件队列显示区域（轴控制下方）"""
@@ -1928,17 +1941,23 @@ class MainWindow(tk.Tk):
         for axis in AXIS_LIMITS:
             self._set_axis_enabled(axis, False)
         self._set_auto_widgets(False)
+        if self._auto_mode == "x_loop":
+            # 允许用同一个按钮停止独立的 X 往复循环。
+            self.x_loop_btn.config(state="normal")
         self.status_var.set("自动循环运行中... X/Y/Z 轴已锁定")
 
     def _unlock_auto_group(self):
         for axis in AXIS_LIMITS:
             self._set_axis_enabled(axis, axis not in self._pending)
         self._set_auto_widgets(True)
+        if not (self._auto_active and self._auto_mode == "x_loop"):
+            self.x_loop_btn.config(text="开始X循环移动")
 
     def _unlock_all(self):
         for axis in self.axis_widgets:
             self._set_axis_enabled(axis, True)
         self._set_auto_widgets(True)
+        self.x_loop_btn.config(text="开始X循环移动")
 
     def _check_arrival(self):
         """每次收到状态帧后调用：到达的轴解锁；自动循环时推进下一段"""
@@ -2133,6 +2152,9 @@ class MainWindow(tk.Tk):
             self._abort_encoder_reset("START_JOB 与维护冲突")
             if not before_reservation:
                 return
+        if self._auto_active and self._auto_mode == "x_loop":
+            self._append_log("[自动] X循环运行中，拒绝 START_JOB\n")
+            return
         if self._workflow_paused and (self._pending or not self.sender.idle):
             self._append_log("[自动] 拒绝 START_JOB：暂停中的运动/发送队列尚未结束\n")
             return
@@ -2216,6 +2238,89 @@ class MainWindow(tk.Tk):
         self.status_var.set("打印完成，全部流程已结束")
         self._append_log(
             "[自动] 打印完成，已结束全部流程并清空 Y 初始位置\n")
+
+    def _toggle_x_loop(self):
+        if self._auto_active and self._auto_mode == "x_loop":
+            self._stop_x_loop()
+            return
+        self._start_x_loop()
+
+    def _start_x_loop(self):
+        try:
+            count = int(self.x_loop_count_var.get().strip())
+            if count < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("错误", "X往复次数必须是正整数")
+            return
+        if self._encoder_active():
+            self._append_log("[X循环] 拒绝：重置编码正在进行\n")
+            return
+        if self._auto_active:
+            messagebox.showwarning("提示", "当前已有自动流程运行，请先停止当前流程")
+            return
+        if not self.sender.connected or not self.sender.idle:
+            messagebox.showwarning("提示", "PLC未连接或仍有指令在发送，请等待后再开始")
+            return
+        if (self._pending or self._maintenance_pending or self.flash_on
+                or self._flash_pausing or self._flash_wait_off
+                or self._flash_after is not None or self._flash_wait_after is not None):
+            messagebox.showwarning("提示", "当前仍有运动或维护操作，请完成后再开始")
+            return
+        if not (AXIS_LIMITS["X"][0] <= X_HOME <= AXIS_LIMITS["X"][1]
+                and AXIS_LIMITS["X"][0] <= X_END <= AXIS_LIMITS["X"][1]):
+            messagebox.showerror(
+                "错误", f"X起始/终点超出行程：[{fmt_pos(X_HOME)}, {fmt_pos(X_END)}]")
+            return
+        if abs(X_HOME - X_END) <= POS_TOLERANCE:
+            messagebox.showerror("错误", "X起始位置和终点位置不能相同")
+            return
+
+        self._auto_active = True
+        self._auto_mode = "x_loop"
+        self._auto_remaining = count
+        self._inner_total = count
+        self._outer_remaining = 1
+        self._auto_ystep = 0.0
+        self._y_start = self.positions["Y"]
+        self._workflow_paused = False
+        self._pause_motion_unlocked = False
+        self._auto_eta = 0.0
+        self._update_cycle_info()
+        self.cycle_info_var.set(f"X循环剩余: {count}")
+        self.x_loop_btn.config(text="停止X循环移动")
+        self._lock_auto_group()
+        self._auto_leg = "x_loop_prehome"
+        self._set_x_speed(X_SPEED_RETURN)
+        self._append_log(
+            f"[X循环] 开始 {count} 次：X {fmt_pos(X_HOME)} <-> {fmt_pos(X_END)}\n")
+        self.sender.send_command(f"X={fmt_pos(X_HOME)}")
+        self._wait_target("X", X_HOME)
+
+    def _stop_x_loop(self):
+        if not (self._auto_active and self._auto_mode == "x_loop"):
+            return
+        self._auto_active = False
+        self._auto_mode = None
+        self._auto_leg = "x_loop_stopped"
+        self._auto_remaining = 0
+        self._outer_remaining = 0
+        self._reset_workflow_pause()
+        self.cycle_info_var.set("")
+        self.x_loop_btn.config(text="开始X循环移动")
+        # 不清除当前 X 的等待目标；当前运动完成后才解锁 X，避免立即叠加新指令。
+        self._unlock_auto_group()
+        self._append_log("[X循环] 已停止；当前已发送的运动会继续，到位后解锁 X 轴\n")
+
+    def _finish_x_loop(self):
+        self._auto_active = False
+        self._auto_mode = None
+        self._auto_leg = "x_loop_complete"
+        self._auto_remaining = 0
+        self._outer_remaining = 0
+        self.cycle_info_var.set("")
+        self.x_loop_btn.config(text="开始X循环移动")
+        self._append_log("[X循环] 全部往复完成\n")
 
     def _start_manual_auto(self):
         try:
@@ -2715,7 +2820,39 @@ class MainWindow(tk.Tk):
         """一段到达后推进自动循环，返回 True 表示已发出下一段"""
         if self._defer_next_action():
             return False
+        if self._auto_mode == "x_loop":
+            if self._auto_leg == "x_loop_prehome":
+                self._auto_leg = "x_loop_end"
+                self._set_x_speed(X_SPEED_OUTBOUND)
+                self._append_log(
+                    f"[X循环] 移动到终点 {fmt_pos(X_END)}\n")
+                self.sender.send_command(f"X={fmt_pos(X_END)}")
+                self._wait_target("X", X_END)
+                return True
+            if self._auto_leg == "x_loop_end":
+                self._auto_leg = "x_loop_home"
+                self._set_x_speed(X_SPEED_RETURN)
+                self._append_log(
+                    f"[X循环] 返回起始位置 {fmt_pos(X_HOME)}\n")
+                self.sender.send_command(f"X={fmt_pos(X_HOME)}")
+                self._wait_target("X", X_HOME)
+                return True
+            if self._auto_leg == "x_loop_home":
+                self._auto_remaining -= 1
+                self.cycle_info_var.set(f"X循环剩余: {self._auto_remaining}")
+                if self._auto_remaining > 0:
+                    self._auto_leg = "x_loop_end"
+                    self._set_x_speed(X_SPEED_OUTBOUND)
+                    self._append_log(
+                        f"[X循环] 开始第 {self._inner_total - self._auto_remaining + 1} 次，"
+                        f"移动到终点 {fmt_pos(X_END)}\n")
+                    self.sender.send_command(f"X={fmt_pos(X_END)}")
+                    self._wait_target("X", X_END)
+                    return True
+                self._finish_x_loop()
+                return False
         if self._auto_leg == "prehome":
+
             # X 回到 HOME 后，再将 Y 移动到配置的 prehome 起始位置。
             if not (AXIS_LIMITS["Y"][0] <= Y_HOME <= AXIS_LIMITS["Y"][1]):
                 self._auto_abort(
